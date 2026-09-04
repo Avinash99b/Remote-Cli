@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-# Script to build standalone binaries for remote-cli and remote-cli-server.
+# Script to build standalone binaries for remote-cli, remote-cli-server, and client.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -27,11 +27,16 @@ $PYINSTALLER_CMD --clean --onefile --name remote-cli manager.py
 echo "Building remote-cli-server (from server.py)..."
 $PYINSTALLER_CMD --clean --onefile --name remote-cli-server server.py
 
+echo "Building client (from client.py)..."
+$PYINSTALLER_CMD --clean --onefile --name client client.py
+
 echo "Copying binaries to repository root..."
 cp dist/remote-cli ./remote-cli
 cp dist/remote-cli-server ./remote-cli-server
+cp dist/client ./client
 
 echo "=== Build Complete ==="
 echo "Output binaries:"
 echo "  1. ./remote-cli (also in ./dist/remote-cli)"
 echo "  2. ./remote-cli-server (also in ./dist/remote-cli-server)"
+echo "  3. ./client (also in ./dist/client)"

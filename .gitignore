@@ -4,4 +4,6 @@ dist/
 *.spec
 remote-cli
 remote-cli-server
+client
+
 
