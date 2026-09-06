@@ -95,10 +95,10 @@ class InferenceClientManager:
     """Client that issues commands to the proxy on behalf of the agent."""
 
     def __init__(self, proxy_url: str, token: Optional[str] = None,
-                 timeout: float = 120.0) -> None:
+                 timeout: Optional[float] = 120.0) -> None:
         self.proxy_url = proxy_url
         self.token = token
-        self.timeout = timeout
+        self.timeout = timeout if timeout is not None else 120.0
 
     def _url(self) -> str:
         if not self.token:
@@ -135,19 +135,22 @@ class InferenceClientManager:
                              timeout: Optional[float],
                              stream_cb: Optional[Callable[[Dict[str, Any]], None]]
                              ) -> Dict[str, Any]:
-        deadline = time.time() + (timeout or self.timeout)
+        eff_timeout = timeout if timeout is not None else self.timeout
+        if eff_timeout is None:
+            eff_timeout = 120.0
+        deadline = time.time() + eff_timeout
         streams: List[Dict[str, Any]] = []
         queued: Optional[Dict[str, Any]] = None
         while True:
             remaining = deadline - time.time()
             if remaining <= 0:
                 raise TimeoutError(
-                    f"no response within {timeout or self.timeout}s")
+                    f"no response within {eff_timeout}s")
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
             except asyncio.TimeoutError:
                 raise TimeoutError(
-                    f"no response within {timeout or self.timeout}s")
+                    f"no response within {eff_timeout}s")
             rmsg = Message.from_json(raw)
             if rmsg.correlation_id != corr_id:
                 continue
@@ -518,6 +521,7 @@ async def _run_command(args: argparse.Namespace,
             print(f"[{p.get('stream', 'out')}] {line}", file=sys.stderr)
 
     return await mgr.request(command, notebook_id=nb, extra=extra,
+                             timeout=extra.get("timeout") if extra else None,
                              stream_cb=stream_cb)
 
 
@@ -525,8 +529,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    mgr_timeout = args.timeout if args.timeout is not None else 120.0
     mgr = InferenceClientManager(proxy_url=args.proxy_url, token=args.token,
-                                 timeout=args.timeout)
+                                 timeout=mgr_timeout)
     try:
         result = asyncio.run(_run_command(args, mgr))
     except TimeoutError as exc:

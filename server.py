@@ -177,6 +177,11 @@ class TestingProxy:
             for nb in self.notebooks.values():
                 if nb.connected and (now - nb.last_heartbeat) > self.heartbeat_timeout:
                     nb.status = "disconnected"
+                    nb.connected = False
+                    if nb.ws is not None:
+                        old_ws = nb.ws
+                        nb.ws = None
+                        asyncio.create_task(self._close(old_ws, 1001, "heartbeat timeout"))
                     log.warning(
                         "notebook %s heartbeat stale (%.1fs) -> disconnected",
                         nb.notebook_id, now - nb.last_heartbeat,
@@ -278,7 +283,8 @@ class TestingProxy:
                 nb = existing
                 resumed = True
                 if nb.connected and nb.ws is not None and nb.ws is not ws:
-                    await self._close(nb.ws, 4001, "superseded by new connection")
+                    old_ws = nb.ws
+                    asyncio.create_task(self._close(old_ws, 4001, "superseded by new connection"))
                 nb.ws = ws
                 nb.connected = True
                 nb.status = "connected"

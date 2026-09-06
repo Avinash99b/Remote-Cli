@@ -192,6 +192,7 @@ class KaggleNotebookRunner:
         self.processes: Dict[str, ManagedProcess] = {}
         self._upload_buffers: Dict[str, Dict[str, Any]] = {}
         self._proc_lock = threading.Lock()
+        self._ws_lock = threading.Lock()
 
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartstop = threading.Event()
@@ -253,16 +254,27 @@ class KaggleNotebookRunner:
             payload={
                 "notebook_id": self.notebook_id or self.requested_id or "auto",
                 "secret": self.secret or "",
-                "info": self.system_info(),
+                "info": self.quick_system_info(),
                 "reconnect": self.notebook_id is not None,
             },
         )
-        ws.send(reg.to_json())
-        raw = ws.recv()
+        self._send_ws(reg)
+        try:
+            raw = ws.recv()
+        except Exception as exc:
+            log.error("failed receiving register ack: %s", exc)
+            try:
+                ws.close()
+            except Exception:
+                pass
+            return
         ack = Message.from_json(raw)
         if ack.message_type != MessageType.REGISTER_ACK:
             log.error("register failed: %s", ack.payload)
-            ws.close()
+            try:
+                ws.close()
+            except Exception:
+                pass
             return
 
         assigned = ack.payload.get("notebook_id")
@@ -307,14 +319,14 @@ class KaggleNotebookRunner:
             if not self.running or not self.connected:
                 return
             try:
-                ws.send(Message(
+                self._send_ws(Message(
                     message_type=MessageType.HEARTBEAT,
                     payload={
                         "workload": self.workload(),
-                        "info": self.system_info(),
+                        "info": self.quick_system_info(),
                         "uptime": time.time() - self.started_at,
                     },
-                ).to_json())
+                ))
             except Exception:
                 return
 
@@ -363,13 +375,24 @@ class KaggleNotebookRunner:
         finally:
             self.current_command = None
 
-    def _reply(self, msg: Message, payload: Dict[str, Any]) -> None:
+    def _send_ws(self, message: Message) -> None:
         if not self.connected or self.ws is None:
             return
-        try:
-            self.ws.send(Message.create_response(msg, payload).to_json())
-        except Exception:
-            pass
+        with self._ws_lock:
+            try:
+                self.ws.send(message.to_json())
+            except Exception:
+                pass
+
+    def _reply(self, msg: Message, payload: Dict[str, Any]) -> None:
+        self._send_ws(Message.create_response(msg, payload))
+
+    def _stream(self, msg: Message, payload: Dict[str, Any]) -> None:
+        self._send_ws(Message(
+            message_type=MessageType.COMMAND_STREAM,
+            correlation_id=msg.message_id,
+            payload=payload,
+        ))
 
     # ------------------------------------------------------------------ #
     # Environment helpers
@@ -620,9 +643,9 @@ class KaggleNotebookRunner:
                     })
 
             import select
-            deadline = time.time() + timeout if timeout else None
+            deadline = (time.time() + timeout) if timeout is not None else None
             while True:
-                if timeout and time.time() > deadline:
+                if deadline is not None and time.time() > deadline:
                     proc.terminate()
                     try:
                         proc.wait(timeout=5)
@@ -910,10 +933,7 @@ class KaggleNotebookRunner:
         info["success"] = True
         return info
 
-    def system_info(self) -> Dict[str, Any]:
-        ram = self._ram_info()
-        disk = self._disk_info()
-        gpus = self._gpu_info()
+    def quick_system_info(self) -> Dict[str, Any]:
         return {
             "hostname": socket.gethostname(),
             "python_version": platform.python_version(),
@@ -925,12 +945,18 @@ class KaggleNotebookRunner:
             "uptime_seconds": self._uptime(),
             "cwd": self._cwd,
             "process_pid": os.getpid(),
-            "ram": ram,
-            "disk": disk,
-            "cuda_version": self._cuda_version(),
-            "gpus": gpus,
-            "installed_packages": self._installed_packages(),
+            "ram": self._ram_info(),
+            "disk": self._disk_info(),
         }
+
+    def system_info(self) -> Dict[str, Any]:
+        info = self.quick_system_info()
+        info.update({
+            "cuda_version": self._cuda_version(),
+            "gpus": self._gpu_info(),
+            "installed_packages": self._installed_packages(),
+        })
+        return info
 
     @staticmethod
     def _uptime() -> float:
