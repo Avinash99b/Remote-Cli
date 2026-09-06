@@ -317,18 +317,17 @@ class KaggleNotebookRunner:
     def _heartbeat_loop(self, ws) -> None:
         while not self._heartstop.wait(timeout=self.heartbeat_interval):
             if not self.running or not self.connected:
-                return
+                break
             try:
                 self._send_ws(Message(
                     message_type=MessageType.HEARTBEAT,
                     payload={
                         "workload": self.workload(),
-                        "info": self.quick_system_info(),
-                        "uptime": time.time() - self.started_at,
+                        "uptime": round(time.time() - self.started_at, 2),
                     },
                 ))
-            except Exception:
-                return
+            except Exception as exc:
+                log.warning("heartbeat send failed: %s", exc)
 
     def workload(self) -> Dict[str, Any]:
         running = 0
@@ -990,28 +989,21 @@ class KaggleNotebookRunner:
 
     @staticmethod
     def _disk_info() -> List[Dict[str, Any]]:
-        mounts = []
-        try:
-            with open("/proc/mounts") as fh:
-                for line in fh:
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[1].startswith("/"):
-                        mounts.append(parts[1])
-        except Exception:
-            mounts = ["/"]
+        mounts = ["/", "/kaggle/working", os.getcwd()]
         seen, out = set(), []
         for mount in mounts:
-            if mount in seen:
+            if not mount or mount in seen:
                 continue
             seen.add(mount)
             try:
-                usage = shutil.disk_usage(mount)
-                out.append({
-                    "mount": mount,
-                    "total_bytes": usage.total,
-                    "used_bytes": usage.used,
-                    "free_bytes": usage.free,
-                })
+                if os.path.exists(mount):
+                    usage = shutil.disk_usage(mount)
+                    out.append({
+                        "mount": mount,
+                        "total_bytes": usage.total,
+                        "used_bytes": usage.used,
+                        "free_bytes": usage.free,
+                    })
             except Exception:
                 continue
         return out
