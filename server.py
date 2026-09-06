@@ -309,6 +309,7 @@ class TestingProxy:
                 nb_id = given_id if given_id != "auto" else self._new_id()
                 nb = NotebookConnection(nb_id, secret or self._new_secret())
                 self.notebooks[nb_id] = nb
+                nb.ws = ws
                 nb.connected = True
                 nb.status = "connected"
                 nb.last_heartbeat = time.time()
