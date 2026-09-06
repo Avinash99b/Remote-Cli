@@ -60,9 +60,13 @@ import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import logging
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from protocol import Message, MessageType, COMMAND_CHUNK_SIZE  # noqa: E402
+
+log = logging.getLogger("manager")
 
 try:
     from websockets.asyncio.client import connect as _ws_connect
@@ -125,6 +129,7 @@ class InferenceClientManager:
             payload.update(extra)
 
         msg = Message(message_type=MessageType.COMMAND, payload=payload)
+        log.info("[MANAGER REQUEST] command=%s msg_id=%s notebook_id=%s", command, msg.message_id[:8], notebook_id)
 
         async with await self._open() as ws:
             await ws.send(msg.to_json())
@@ -144,16 +149,19 @@ class InferenceClientManager:
         while True:
             remaining = deadline - time.time()
             if remaining <= 0:
+                log.warning("[MANAGER TIMEOUT] no response within %.1fs (corr_id=%s)", eff_timeout, corr_id[:8])
                 raise TimeoutError(
                     f"no response within {eff_timeout}s")
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
             except asyncio.TimeoutError:
+                log.warning("[MANAGER TIMEOUT] no response within %.1fs (corr_id=%s)", eff_timeout, corr_id[:8])
                 raise TimeoutError(
                     f"no response within {eff_timeout}s")
             rmsg = Message.from_json(raw)
             if rmsg.correlation_id != corr_id:
                 continue
+            log.info("[MANAGER RECV] msg_type=%s corr_id=%s payload=%s", rmsg.message_type.value, corr_id[:8], rmsg.payload)
             if rmsg.message_type == MessageType.COMMAND_STREAM:
                 streams.append(rmsg.payload)
                 if stream_cb:

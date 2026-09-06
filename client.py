@@ -244,10 +244,11 @@ class KaggleNotebookRunner:
             url = f"{url}{sep}token={self.token}"
 
         kwargs = dict(max_size=None, ping_interval=20, ping_timeout=20)
+        log.info("[CONNECT] connecting to proxy %s", url)
         ws = _ws_connect(url, **kwargs)
         self.ws = ws
         self.connected = True
-        log.info("connected to proxy %s", url)
+        log.info("[CONNECTED] websocket open to proxy %s", url)
 
         reg = Message(
             message_type=MessageType.REGISTER,
@@ -258,11 +259,12 @@ class KaggleNotebookRunner:
                 "reconnect": self.notebook_id is not None,
             },
         )
+        log.info("[REGISTER] sending register message (requested_id=%s)", reg.payload["notebook_id"])
         self._send_ws(reg)
         try:
             raw = ws.recv()
         except Exception as exc:
-            log.error("failed receiving register ack: %s", exc)
+            log.error("[REGISTER] failed receiving register ack: %s", exc)
             try:
                 ws.close()
             except Exception:
@@ -270,7 +272,7 @@ class KaggleNotebookRunner:
             return
         ack = Message.from_json(raw)
         if ack.message_type != MessageType.REGISTER_ACK:
-            log.error("register failed: %s", ack.payload)
+            log.error("[REGISTER] register failed: %s", ack.payload)
             try:
                 ws.close()
             except Exception:
@@ -283,16 +285,17 @@ class KaggleNotebookRunner:
             self.secret = ack.payload["secret"]
         self._save_identity()
         if ack.payload.get("queued_flushed"):
-            log.info("resumed notebook %s; flushed %s queued commands",
+            log.info("[REGISTER_ACK] resumed notebook %s; flushed %s queued commands",
                      assigned, ack.payload["queued_flushed"])
         else:
-            log.info("registered as notebook %s", assigned)
+            log.info("[REGISTER_ACK] registered as notebook %s", assigned)
 
         # Start heartbeat loop in a daemon thread
         self._heartstop.clear()
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop, args=(ws,), daemon=True)
         self._heartbeat_thread.start()
+        log.info("[HEARTBEAT] background heartbeat thread started (interval=%.1fs)", self.heartbeat_interval)
 
         try:
             while self.running and self.connected:
@@ -301,12 +304,14 @@ class KaggleNotebookRunner:
                 except TimeoutError:
                     continue
                 except Exception as exc:
-                    log.warning("connection receive error: %s (%s)", type(exc).__name__, exc)
+                    log.warning("[RECV LOOP] connection error: %s (%s)", type(exc).__name__, exc)
                     break
                 try:
                     msg = Message.from_json(raw)
                 except json.JSONDecodeError:
+                    log.warning("[RECV LOOP] unparseable message from proxy")
                     continue
+                log.info("[RECV] msg_type=%s id=%s corr=%s", msg.message_type.value, msg.message_id[:8], (msg.correlation_id or "-")[:8])
                 if msg.message_type == MessageType.COMMAND:
                     self._handle_command(msg)
         finally:
@@ -315,22 +320,25 @@ class KaggleNotebookRunner:
                 self._heartbeat_thread.join(timeout=5)
             self.connected = False
             self.ws = None
-            log.info("disconnected from proxy")
+            log.info("[DISCONNECTED] connection loop exited; socket closed")
 
     def _heartbeat_loop(self, ws) -> None:
         while not self._heartstop.wait(timeout=self.heartbeat_interval):
             if not self.running or not self.connected:
+                log.info("[HEARTBEAT LOOP] exiting thread (running=%s, connected=%s)", self.running, self.connected)
                 break
             try:
-                self._send_ws(Message(
+                hb_msg = Message(
                     message_type=MessageType.HEARTBEAT,
                     payload={
                         "workload": self.workload(),
                         "uptime": round(time.time() - self.started_at, 2),
                     },
-                ))
+                )
+                log.info("[HEARTBEAT SEND] sending heartbeat msg_id=%s", hb_msg.message_id[:8])
+                self._send_ws(hb_msg)
             except Exception as exc:
-                log.warning("heartbeat send failed: %s", exc)
+                log.warning("[HEARTBEAT SEND FAILED] error: %s", exc)
                 self.connected = False
                 break
 
@@ -381,12 +389,14 @@ class KaggleNotebookRunner:
 
     def _send_ws(self, message: Message) -> None:
         if not self.connected or self.ws is None:
+            log.warning("[SEND ws FAILED] socket not connected or ws is None (connected=%s)", self.connected)
             return
         with self._ws_lock:
             try:
+                log.info("[SEND ws] type=%s id=%s corr=%s", message.message_type.value, message.message_id[:8], (message.correlation_id or "-")[:8])
                 self.ws.send(message.to_json())
             except Exception as exc:
-                log.warning("websocket send failed: %s; marking disconnected", exc)
+                log.warning("[SEND ws ERROR] websocket send failed: %s; marking disconnected", exc)
                 self.connected = False
                 if self.ws is not None:
                     try:

@@ -255,17 +255,20 @@ class TestingProxy:
     async def _handle_notebook(self, ws) -> None:
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=30)
-        except Exception:
+        except Exception as exc:
+            log.warning("notebook register timeout/error: %s", exc)
             await self._close(ws, 1008, "register timeout")
             return
 
         try:
             reg = Message.from_json(raw)
         except json.JSONDecodeError:
+            log.warning("unparseable register message from notebook")
             await self._close(ws, 1008, "unparseable register message")
             return
 
         if reg.message_type != MessageType.REGISTER:
+            log.warning("first message from notebook was %s, expected REGISTER", reg.message_type)
             await self._close(ws, 1008, "first message must be register")
             return
 
@@ -274,15 +277,20 @@ class TestingProxy:
         secret = payload.get("secret") or ""
         info = payload.get("info")
 
+        log.info("notebook registering given_id=%s secret_provided=%s info=%s",
+                 given_id, bool(secret), bool(info))
+
         async with self._lock:
             existing = self.notebooks.get(given_id)
             if existing is not None:
                 if existing.secret and secret != existing.secret:
+                    log.warning("rejected notebook %s: bad secret", given_id)
                     await self._close(ws, 4001, "unauthorized: bad secret")
                     return
                 nb = existing
                 resumed = True
                 if nb.connected and nb.ws is not None and nb.ws is not ws:
+                    log.info("superseding old WebSocket for notebook %s", nb.notebook_id)
                     old_ws = nb.ws
                     asyncio.create_task(self._close(old_ws, 4001, "superseded by new connection"))
                 nb.ws = ws
@@ -295,6 +303,8 @@ class TestingProxy:
                 queued = list(nb.pending_queue)
                 nb.pending_queue.clear()
                 self.total_notebook_connects += 1
+                log.info("resumed registered notebook: %s (flushing %d queued commands)",
+                         nb.notebook_id, len(queued))
             else:
                 nb_id = given_id if given_id != "auto" else self._new_id()
                 nb = NotebookConnection(nb_id, secret or self._new_secret())
@@ -307,7 +317,7 @@ class TestingProxy:
                 resumed = False
                 queued = []
                 self.total_notebook_connects += 1
-                log.info("notebook registered: %s", nb.notebook_id)
+                log.info("registered new notebook: %s (secret=%s)", nb.notebook_id, nb.secret[:6] + "...")
 
             ack = Message(
                 message_type=MessageType.REGISTER_ACK,
@@ -324,6 +334,7 @@ class TestingProxy:
             await self._send(ws, ack)
 
         for qmsg in queued:
+            log.info("flushing queued command %s to notebook %s", qmsg.message_id[:8], nb.notebook_id)
             await self._send(ws, qmsg)
             self.total_commands += 1
 
@@ -332,25 +343,32 @@ class TestingProxy:
                 try:
                     msg = Message.from_json(raw)
                 except json.JSONDecodeError:
+                    log.warning("unparseable message from notebook %s", nb.notebook_id)
                     continue
+                log.info("[RECV notebook %s] msg_type=%s id=%s corr=%s",
+                         nb.notebook_id, msg.message_type.value, msg.message_id[:8], (msg.correlation_id or "-")[:8])
                 await self._handle_notebook_message(nb, msg)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("notebook %s connection loop error: %s", nb.notebook_id, exc)
         finally:
             nb.status = "disconnected"
             if nb.ws is ws:
                 nb.connected = False
                 nb.ws = None
-            log.info("notebook disconnected: %s", nb.notebook_id)
+            log.info("notebook connection closed: %s (connected=%s)", nb.notebook_id, nb.connected)
 
     async def _handle_notebook_message(self, nb: NotebookConnection, msg: Message) -> None:
         if msg.message_type == MessageType.HEARTBEAT:
-            nb.last_heartbeat = time.time()
+            now = time.time()
+            dt = now - nb.last_heartbeat
+            nb.last_heartbeat = now
             p = msg.payload or {}
             if isinstance(p.get("info"), dict):
                 nb.info = p["info"]
             if isinstance(p.get("workload"), dict):
                 nb.workload = p["workload"]
+            log.info("[HEARTBEAT notebook %s] updated heartbeat (dt=%.2fs, workload=%s)",
+                     nb.notebook_id, dt, nb.workload)
             await self._send(
                 nb.ws,
                 Message(
@@ -487,6 +505,7 @@ class TestingProxy:
         corr = msg.message_id
 
         if nb is None:
+            log.warning("cannot route command %s: unknown notebook_id %s", corr[:8], notebook_id)
             await self._send(ws, Message.create_response(msg, {
                 "success": False,
                 "error": f"unknown notebook_id {notebook_id!r}",
@@ -494,27 +513,29 @@ class TestingProxy:
             }))
             return
 
+        hb_age = round(time.time() - nb.last_heartbeat, 2)
+        log.info("[ROUTE command %s -> %s] connected=%s ws_present=%s hb_age=%.2fs pending_queue=%d",
+                 corr[:8], notebook_id, nb.connected, nb.ws is not None, hb_age, len(nb.pending_queue))
+
         async with self._lock:
             self.pending[corr] = mgr_id
             self.total_commands += 1
             if nb.connected and nb.ws is not None:
                 target_ws = nb.ws
                 should_queue = None
-            elif nb.connected is False and nb.ws is not None:
-                target_ws = None
-                should_queue = msg
             else:
                 target_ws = None
                 should_queue = msg
 
         if target_ws is not None:
             try:
+                log.info("sending command %s directly to notebook %s WebSocket", corr[:8], notebook_id)
                 await target_ws.send(msg.to_json())
                 return
             except Exception as exc:
                 log.warning(
-                    "failed to send to notebook %s (%s); marking offline and queuing",
-                    notebook_id, exc,
+                    "failed to send command %s to notebook %s (%s); marking offline and queuing",
+                    corr[:8], notebook_id, exc,
                 )
                 async with self._lock:
                     nb.connected = False
