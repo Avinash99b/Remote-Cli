@@ -110,7 +110,7 @@ class TestingProxy:
     """The persistent coordinator between managers and notebook runners."""
 
     def __init__(self, host: str, port: int, token: Optional[str] = None,
-                 heartbeat_timeout: float = 30.0, queue_max: int = 100,
+                 heartbeat_timeout: float = 60.0, queue_max: int = 100,
                  monitor_interval: float = 5.0) -> None:
         self.host = host
         self.port = port
@@ -508,8 +508,19 @@ class TestingProxy:
                 should_queue = msg
 
         if target_ws is not None:
-            await self._send(target_ws, msg)
-            return
+            try:
+                await target_ws.send(msg.to_json())
+                return
+            except Exception as exc:
+                log.warning(
+                    "failed to send to notebook %s (%s); marking offline and queuing",
+                    notebook_id, exc,
+                )
+                async with self._lock:
+                    nb.connected = False
+                    nb.status = "disconnected"
+                    nb.ws = None
+                    should_queue = msg
 
         if should_queue is not None:
             if len(nb.pending_queue) >= self.queue_max:
@@ -562,7 +573,7 @@ def main() -> int:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--token", default=None, help="shared auth token (optional)")
-    parser.add_argument("--heartbeat-timeout", type=float, default=30.0)
+    parser.add_argument("--heartbeat-timeout", type=float, default=60.0)
     parser.add_argument("--queue-max", type=int, default=100)
     parser.add_argument("--monitor-interval", type=float, default=5.0)
     parser.add_argument("--log-level", default="INFO")

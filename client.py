@@ -166,7 +166,7 @@ class KaggleNotebookRunner:
     def __init__(self, proxy_url: str, token: Optional[str] = None,
                  notebook_id: Optional[str] = None,
                  identity_file: str = ".notebook_identity.json",
-                 heartbeat_interval: float = 10.0,
+                 heartbeat_interval: float = 5.0,
                  reconnect_max_delay: float = 30.0) -> None:
         self.proxy_url = proxy_url
         self.token = token
@@ -295,10 +295,13 @@ class KaggleNotebookRunner:
         self._heartbeat_thread.start()
 
         try:
-            while self.running:
+            while self.running and self.connected:
                 try:
-                    raw = ws.recv()
-                except Exception:
+                    raw = ws.recv(timeout=10.0)
+                except TimeoutError:
+                    continue
+                except Exception as exc:
+                    log.warning("connection receive error: %s (%s)", type(exc).__name__, exc)
                     break
                 try:
                     msg = Message.from_json(raw)
@@ -328,6 +331,8 @@ class KaggleNotebookRunner:
                 ))
             except Exception as exc:
                 log.warning("heartbeat send failed: %s", exc)
+                self.connected = False
+                break
 
     def workload(self) -> Dict[str, Any]:
         running = 0
@@ -380,8 +385,14 @@ class KaggleNotebookRunner:
         with self._ws_lock:
             try:
                 self.ws.send(message.to_json())
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("websocket send failed: %s; marking disconnected", exc)
+                self.connected = False
+                if self.ws is not None:
+                    try:
+                        self.ws.close()
+                    except Exception:
+                        pass
 
     def _reply(self, msg: Message, payload: Dict[str, Any]) -> None:
         self._send_ws(Message.create_response(msg, payload))
