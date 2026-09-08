@@ -34,6 +34,7 @@ import argparse
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
 import signal
 import sys
@@ -139,8 +140,8 @@ class TestingProxy:
             host=self.host,
             port=self.port,
             max_size=None,
-            ping_interval=20,
-            ping_timeout=20,
+            ping_interval=10,
+            ping_timeout=10,
         )
         log.info("testing_proxy listening on ws://%s:%s", self.host, self.port)
 
@@ -148,15 +149,27 @@ class TestingProxy:
             async with _serve(**kwargs) as _server:
                 self._server = _server
                 monitor = asyncio.create_task(self._monitor_loop())
-                await _server.serve_forever()
-                monitor.cancel()
+                try:
+                    await _server.serve_forever()
+                finally:
+                    monitor.cancel()
+                    try:
+                        await monitor
+                    except asyncio.CancelledError:
+                        pass
         else:  # pragma: no cover - legacy websockets
             _server = await _serve(**kwargs)
             self._server = _server
             async with _server:
                 monitor = asyncio.create_task(self._monitor_loop())
-                await _server.serve_forever()
-                monitor.cancel()
+                try:
+                    await _server.serve_forever()
+                finally:
+                    monitor.cancel()
+                    try:
+                        await monitor
+                    except asyncio.CancelledError:
+                        pass
 
     def _request_shutdown(self, sig=None) -> None:
         try:
@@ -172,21 +185,31 @@ class TestingProxy:
 
     async def _monitor_loop(self) -> None:
         while not self._shutting_down:
-            await asyncio.sleep(self.monitor_interval)
-            now = time.time()
-            for nb in self.notebooks.values():
-                if nb.connected and (now - nb.last_heartbeat) > self.heartbeat_timeout:
-                    nb.status = "disconnected"
-                    nb.connected = False
-                    if nb.ws is not None:
-                        old_ws = nb.ws
-                        nb.ws = None
-                        asyncio.create_task(self._close(old_ws, 1001, "heartbeat timeout"))
-                    log.warning(
-                        "notebook %s heartbeat stale (%.1fs) -> disconnected",
-                        nb.notebook_id, now - nb.last_heartbeat,
-                    )
-            await self._gc_pending()
+            try:
+                await asyncio.sleep(self.monitor_interval)
+                now = time.time()
+                for nb in list(self.notebooks.values()):
+                    try:
+                        if nb.connected and (now - nb.last_heartbeat) > self.heartbeat_timeout:
+                            nb.status = "disconnected"
+                            nb.connected = False
+                            if nb.ws is not None:
+                                old_ws = nb.ws
+                                nb.ws = None
+                                asyncio.create_task(self._close(old_ws, 1001, "heartbeat timeout"))
+                            log.warning(
+                                "notebook %s heartbeat stale (%.1fs) -> disconnected",
+                                nb.notebook_id, now - nb.last_heartbeat,
+                            )
+                    except Exception as exc:
+                        log.error("[MONITOR] error checking notebook %s: %s",
+                                  nb.notebook_id, exc)
+                await self._gc_pending()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.error("[MONITOR] unexpected error in monitor loop: %s (%s)",
+                          type(exc).__name__, exc)
 
     async def _gc_pending(self) -> None:
         async with self._lock:
@@ -246,8 +269,9 @@ class TestingProxy:
             return
         try:
             await ws.send(message.to_json())
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("[SEND] failed to send message %s: %s (%s)",
+                        message.message_id[:8], type(exc).__name__, exc)
 
     # ------------------------------------------------------------------ #
     # Notebook (runner) connections
@@ -348,9 +372,17 @@ class TestingProxy:
                     continue
                 log.info("[RECV notebook %s] msg_type=%s id=%s corr=%s",
                          nb.notebook_id, msg.message_type.value, msg.message_id[:8], (msg.correlation_id or "-")[:8])
-                await self._handle_notebook_message(nb, msg)
+                try:
+                    await self._handle_notebook_message(nb, msg)
+                except Exception as exc:
+                    log.error("[NOTEBOOK %s] error handling message %s: %s (%s)",
+                              nb.notebook_id, msg.message_id[:8],
+                              type(exc).__name__, exc)
+        except asyncio.CancelledError:
+            log.info("notebook %s connection cancelled", nb.notebook_id)
         except Exception as exc:
-            log.warning("notebook %s connection loop error: %s", nb.notebook_id, exc)
+            log.warning("notebook %s connection loop error: %s (%s)",
+                        nb.notebook_id, type(exc).__name__, exc)
         finally:
             nb.status = "disconnected"
             if nb.ws is ws:
@@ -410,10 +442,19 @@ class TestingProxy:
                 try:
                     msg = Message.from_json(raw)
                 except json.JSONDecodeError:
+                    log.warning("[MANAGER %s] unparseable message", mgr_id)
                     continue
-                await self._handle_manager_message(mgr_id, ws, msg)
-        except Exception:
-            pass
+                try:
+                    await self._handle_manager_message(mgr_id, ws, msg)
+                except Exception as exc:
+                    log.error("[MANAGER %s] error handling message %s: %s (%s)",
+                              mgr_id, msg.message_id[:8],
+                              type(exc).__name__, exc)
+        except asyncio.CancelledError:
+            log.info("manager %s connection cancelled", mgr_id)
+        except Exception as exc:
+            log.warning("manager %s connection error: %s (%s)",
+                        mgr_id, type(exc).__name__, exc)
         finally:
             self.managers.pop(mgr_id, None)
             async with self._lock:
@@ -590,6 +631,37 @@ async def _run(proxy: TestingProxy) -> None:
     await proxy.serve_forever()
 
 
+def _setup_logging(log_level: str, log_file: Optional[str] = None) -> None:
+    """Configure logging with both console and optional file output."""
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s")
+
+    # Console handler
+    console = logging.StreamHandler(sys.stderr)
+    console.setLevel(level)
+    console.setFormatter(fmt)
+    root_logger.addHandler(console)
+
+    # File handler (rotating, 10MB per file, keep 5 backups)
+    if log_file:
+        try:
+            log_dir = os.path.dirname(os.path.abspath(log_file))
+            os.makedirs(log_dir, exist_ok=True)
+            file_handler = logging.handlers.RotatingFileHandler(
+                log_file, maxBytes=10 * 1024 * 1024, backupCount=5,
+                encoding="utf-8",
+            )
+            file_handler.setLevel(level)
+            file_handler.setFormatter(fmt)
+            root_logger.addHandler(file_handler)
+            log.info("logging to file: %s", log_file)
+        except Exception as exc:
+            log.warning("could not set up log file %s: %s", log_file, exc)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Remote testing WebSocket proxy")
     parser.add_argument("--host", default="0.0.0.0")
@@ -599,12 +671,12 @@ def main() -> int:
     parser.add_argument("--queue-max", type=int, default=100)
     parser.add_argument("--monitor-interval", type=float, default=5.0)
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--log-file", default=None,
+                        help="path to log file (rotating, 10MB, 5 backups)")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)-7s %(message)s",
-    )
+    _setup_logging(args.log_level, args.log_file)
+
     proxy = TestingProxy(
         host=args.host, port=args.port, token=args.token,
         heartbeat_timeout=args.heartbeat_timeout, queue_max=args.queue_max,
@@ -616,16 +688,22 @@ def main() -> int:
             try:
                 await _run(proxy)
                 return
-            except OSError as exc:
+            except asyncio.CancelledError:
+                log.info("server task cancelled; shutting down")
+                return
+            except Exception as exc:
                 if proxy._shutting_down:
                     return
-                log.error("server error: %s; restarting in 1s", exc)
+                log.error("server error: %s (%s); restarting in 1s",
+                          type(exc).__name__, exc)
                 await asyncio.sleep(1)
 
     try:
+        log.info("=== Server starting (pid=%d) host=%s port=%d ===",
+                 os.getpid(), args.host, args.port)
         asyncio.run(_restartable())
     except KeyboardInterrupt:
-        pass
+        log.info("server interrupted by keyboard")
     return 0
 
 

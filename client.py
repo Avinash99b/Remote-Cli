@@ -53,6 +53,7 @@ import hashlib
 import io
 import json
 import logging
+import logging.handlers
 import os
 import platform
 import shlex
@@ -167,13 +168,15 @@ class KaggleNotebookRunner:
                  notebook_id: Optional[str] = None,
                  identity_file: str = ".notebook_identity.json",
                  heartbeat_interval: float = 5.0,
-                 reconnect_max_delay: float = 30.0) -> None:
+                 reconnect_delay: float = 5.0,
+                 max_heartbeat_misses: int = 3) -> None:
         self.proxy_url = proxy_url
         self.token = token
         self.requested_id = notebook_id
         self.identity_file = identity_file
         self.heartbeat_interval = heartbeat_interval
-        self.reconnect_max_delay = reconnect_max_delay
+        self.reconnect_delay = reconnect_delay
+        self.max_heartbeat_misses = max_heartbeat_misses
 
         self.running = True
         self.connected = False
@@ -183,6 +186,7 @@ class KaggleNotebookRunner:
         self.current_command: Optional[Dict[str, Any]] = None
         self.started_at = time.time()
         self.command_count = 0
+        self._consecutive_hb_misses = 0
 
         self._cwd = os.getcwd()
         self._ns: Dict[str, Any] = {
@@ -225,16 +229,20 @@ class KaggleNotebookRunner:
     # Synchronous main loop with auto-reconnect + heartbeats
     # ------------------------------------------------------------------ #
     def _run_loop(self) -> None:
-        delay = 1.0
+        attempt = 0
         while self.running:
+            attempt += 1
             try:
+                log.info("[RECONNECT] attempt #%d", attempt)
                 self._connect_once()
-                delay = 1.0
+                attempt = 0  # reset on successful connection
             except Exception as exc:
-                log.warning("connection error: %s", exc)
+                log.warning("[RECONNECT] connection error on attempt #%d: %s (%s)",
+                            attempt, type(exc).__name__, exc)
             if self.running:
-                time.sleep(delay)
-                delay = min(delay * 2, self.reconnect_max_delay)
+                log.info("[RECONNECT] will retry in %.1fs (attempt #%d)",
+                         self.reconnect_delay, attempt)
+                time.sleep(self.reconnect_delay)
         log.info("runner loop ended")
 
     def _connect_once(self) -> None:
@@ -243,64 +251,65 @@ class KaggleNotebookRunner:
             sep = "&" if "?" in url else "?"
             url = f"{url}{sep}token={self.token}"
 
-        kwargs = dict(max_size=None, ping_interval=20, ping_timeout=20)
+        kwargs = dict(max_size=None, ping_interval=10, ping_timeout=10,
+                      close_timeout=5)
         log.info("[CONNECT] connecting to proxy %s", url)
-        ws = _ws_connect(url, **kwargs)
+        try:
+            ws = _ws_connect(url, **kwargs)
+        except Exception as exc:
+            log.error("[CONNECT] failed to open websocket: %s (%s)",
+                      type(exc).__name__, exc)
+            raise
         self.ws = ws
         self.connected = True
+        self._consecutive_hb_misses = 0
         log.info("[CONNECTED] websocket open to proxy %s", url)
 
-        reg = Message(
-            message_type=MessageType.REGISTER,
-            payload={
-                "notebook_id": self.notebook_id or self.requested_id or "auto",
-                "secret": self.secret or "",
-                "info": self.quick_system_info(),
-                "reconnect": self.notebook_id is not None,
-            },
-        )
-        log.info("[REGISTER] sending register message (requested_id=%s)", reg.payload["notebook_id"])
-        self._send_ws(reg)
         try:
-            raw = ws.recv()
-        except Exception as exc:
-            log.error("[REGISTER] failed receiving register ack: %s", exc)
+            reg = Message(
+                message_type=MessageType.REGISTER,
+                payload={
+                    "notebook_id": self.notebook_id or self.requested_id or "auto",
+                    "secret": self.secret or "",
+                    "info": self.quick_system_info(),
+                    "reconnect": self.notebook_id is not None,
+                },
+            )
+            log.info("[REGISTER] sending register message (requested_id=%s)", reg.payload["notebook_id"])
+            self._send_ws(reg)
             try:
-                ws.close()
-            except Exception:
-                pass
-            return
-        ack = Message.from_json(raw)
-        if ack.message_type != MessageType.REGISTER_ACK:
-            log.error("[REGISTER] register failed: %s", ack.payload)
-            try:
-                ws.close()
-            except Exception:
-                pass
-            return
+                raw = ws.recv(timeout=30)
+            except Exception as exc:
+                log.error("[REGISTER] failed receiving register ack: %s", exc)
+                self._safe_close_ws(ws)
+                return
+            ack = Message.from_json(raw)
+            if ack.message_type != MessageType.REGISTER_ACK:
+                log.error("[REGISTER] register failed: %s", ack.payload)
+                self._safe_close_ws(ws)
+                return
 
-        assigned = ack.payload.get("notebook_id")
-        self.notebook_id = assigned
-        if ack.payload.get("secret"):
-            self.secret = ack.payload["secret"]
-        self._save_identity()
-        if ack.payload.get("queued_flushed"):
-            log.info("[REGISTER_ACK] resumed notebook %s; flushed %s queued commands",
-                     assigned, ack.payload["queued_flushed"])
-        else:
-            log.info("[REGISTER_ACK] registered as notebook %s", assigned)
+            assigned = ack.payload.get("notebook_id")
+            self.notebook_id = assigned
+            if ack.payload.get("secret"):
+                self.secret = ack.payload["secret"]
+            self._save_identity()
+            if ack.payload.get("queued_flushed"):
+                log.info("[REGISTER_ACK] resumed notebook %s; flushed %s queued commands",
+                         assigned, ack.payload["queued_flushed"])
+            else:
+                log.info("[REGISTER_ACK] registered as notebook %s", assigned)
 
-        # Start heartbeat loop in a daemon thread
-        self._heartstop.clear()
-        self._heartbeat_thread = threading.Thread(
-            target=self._heartbeat_loop, args=(ws,), daemon=True)
-        self._heartbeat_thread.start()
-        log.info("[HEARTBEAT] background heartbeat thread started (interval=%.1fs)", self.heartbeat_interval)
+            # Start heartbeat loop in a daemon thread
+            self._heartstop.clear()
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop, args=(ws,), daemon=True)
+            self._heartbeat_thread.start()
+            log.info("[HEARTBEAT] background heartbeat thread started (interval=%.1fs)", self.heartbeat_interval)
 
-        try:
             while self.running and self.connected:
                 try:
-                    raw = ws.recv(timeout=10.0)
+                    raw = ws.recv(timeout=5.0)
                 except TimeoutError:
                     continue
                 except Exception as exc:
@@ -314,13 +323,28 @@ class KaggleNotebookRunner:
                 log.info("[RECV] msg_type=%s id=%s corr=%s", msg.message_type.value, msg.message_id[:8], (msg.correlation_id or "-")[:8])
                 if msg.message_type == MessageType.COMMAND:
                     self._handle_command(msg)
+                elif msg.message_type == MessageType.HEARTBEAT_ACK:
+                    self._consecutive_hb_misses = 0
+        except Exception as exc:
+            log.error("[CONNECT_ONCE] unexpected error in connection loop: %s (%s)",
+                      type(exc).__name__, exc)
         finally:
             self._heartstop.set()
             if self._heartbeat_thread is not None:
                 self._heartbeat_thread.join(timeout=5)
             self.connected = False
+            self._safe_close_ws(ws)
             self.ws = None
             log.info("[DISCONNECTED] connection loop exited; socket closed")
+
+    def _safe_close_ws(self, ws) -> None:
+        """Safely close a WebSocket, ignoring all errors."""
+        if ws is None:
+            return
+        try:
+            ws.close()
+        except Exception:
+            pass
 
     def _heartbeat_loop(self, ws) -> None:
         while not self._heartstop.wait(timeout=self.heartbeat_interval):
@@ -335,10 +359,19 @@ class KaggleNotebookRunner:
                         "uptime": round(time.time() - self.started_at, 2),
                     },
                 )
-                log.info("[HEARTBEAT SEND] sending heartbeat msg_id=%s", hb_msg.message_id[:8])
+                log.info("[HEARTBEAT SEND] sending heartbeat msg_id=%s (consecutive_misses=%d)",
+                         hb_msg.message_id[:8], self._consecutive_hb_misses)
                 self._send_ws(hb_msg)
+                self._consecutive_hb_misses += 1
+                if self._consecutive_hb_misses >= self.max_heartbeat_misses:
+                    log.warning("[HEARTBEAT] %d consecutive heartbeats without ACK; "
+                                "forcing disconnect to trigger reconnect",
+                                self._consecutive_hb_misses)
+                    self.connected = False
+                    self._safe_close_ws(self.ws)
+                    break
             except Exception as exc:
-                log.warning("[HEARTBEAT SEND FAILED] error: %s", exc)
+                log.warning("[HEARTBEAT SEND FAILED] error: %s (%s)", type(exc).__name__, exc)
                 self.connected = False
                 break
 
@@ -396,13 +429,10 @@ class KaggleNotebookRunner:
                 log.info("[SEND ws] type=%s id=%s corr=%s", message.message_type.value, message.message_id[:8], (message.correlation_id or "-")[:8])
                 self.ws.send(message.to_json())
             except Exception as exc:
-                log.warning("[SEND ws ERROR] websocket send failed: %s; marking disconnected", exc)
+                log.warning("[SEND ws ERROR] websocket send failed: %s (%s); marking disconnected",
+                            type(exc).__name__, exc)
                 self.connected = False
-                if self.ws is not None:
-                    try:
-                        self.ws.close()
-                    except Exception:
-                        pass
+                self._safe_close_ws(self.ws)
 
     def _reply(self, msg: Message, payload: Dict[str, Any]) -> None:
         self._send_ws(Message.create_response(msg, payload))
@@ -1113,8 +1143,11 @@ class KaggleNotebookRunner:
 
 def start_in_background(proxy_url: str, token: Optional[str] = None,
                         notebook_id: Optional[str] = None,
-                        heartbeat_interval: float = 10.0) -> threading.Thread:
+                        heartbeat_interval: float = 10.0,
+                        log_file: Optional[str] = None) -> threading.Thread:
     """Start the runner in a background daemon thread (for notebook cells)."""
+    if log_file:
+        _setup_logging("INFO", log_file)
     runner = KaggleNotebookRunner(
         proxy_url=proxy_url, token=token, notebook_id=notebook_id,
         heartbeat_interval=heartbeat_interval,
@@ -1132,6 +1165,37 @@ def start_in_background(proxy_url: str, token: Optional[str] = None,
     return thread
 
 
+def _setup_logging(log_level: str, log_file: Optional[str] = None) -> None:
+    """Configure logging with both console and optional file output."""
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s")
+
+    # Console handler
+    console = logging.StreamHandler(sys.stderr)
+    console.setLevel(level)
+    console.setFormatter(fmt)
+    root_logger.addHandler(console)
+
+    # File handler (rotating, 10MB per file, keep 5 backups)
+    if log_file:
+        try:
+            log_dir = os.path.dirname(os.path.abspath(log_file))
+            os.makedirs(log_dir, exist_ok=True)
+            file_handler = logging.handlers.RotatingFileHandler(
+                log_file, maxBytes=10 * 1024 * 1024, backupCount=5,
+                encoding="utf-8",
+            )
+            file_handler.setLevel(level)
+            file_handler.setFormatter(fmt)
+            root_logger.addHandler(file_handler)
+            log.info("logging to file: %s", log_file)
+        except Exception as exc:
+            log.warning("could not set up log file %s: %s", log_file, exc)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Remote testing agent for a Kaggle notebook")
@@ -1142,20 +1206,23 @@ def main() -> int:
     parser.add_argument("--notebook-id", default=None)
     parser.add_argument("--identity-file", default=".notebook_identity.json")
     parser.add_argument("--heartbeat-interval", type=float, default=10.0)
-    parser.add_argument("--reconnect-max-delay", type=float, default=30.0)
+    parser.add_argument("--reconnect-delay", type=float, default=5.0,
+                        help="fixed delay in seconds between reconnect attempts (default: 5)")
+    parser.add_argument("--max-heartbeat-misses", type=int, default=3,
+                        help="consecutive heartbeat misses before forcing reconnect (default: 3)")
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--log-file", default=None,
+                        help="path to log file (rotating, 10MB, 5 backups)")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)-7s %(message)s",
-    )
+    _setup_logging(args.log_level, args.log_file)
 
     runner = KaggleNotebookRunner(
         proxy_url=args.proxy, token=args.token, notebook_id=args.notebook_id,
         identity_file=args.identity_file,
         heartbeat_interval=args.heartbeat_interval,
-        reconnect_max_delay=args.reconnect_max_delay,
+        reconnect_delay=args.reconnect_delay,
+        max_heartbeat_misses=args.max_heartbeat_misses,
     )
     runner._load_identity()
 
@@ -1164,6 +1231,8 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, _signal)
     signal.signal(signal.SIGINT, _signal)
+    log.info("=== Client starting (pid=%d) reconnect_delay=%.1fs max_hb_misses=%d ===",
+             os.getpid(), args.reconnect_delay, args.max_heartbeat_misses)
     runner.run()
     return 0
 
