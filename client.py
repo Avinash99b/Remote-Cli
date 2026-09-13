@@ -56,6 +56,7 @@ import logging
 import logging.handlers
 import os
 import platform
+import queue
 import shlex
 import shutil
 import signal
@@ -90,6 +91,57 @@ if not _WS_SYNC:  # pragma: no cover
     )
 
 log = logging.getLogger("kaggle_runner")
+
+
+def _popen_kwargs() -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {}
+    if os.name == "posix":
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def _kill_process_tree(proc: subprocess.Popen, sig: int = 15, timeout: float = 5.0) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    pid = proc.pid
+    if os.name == "posix":
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, OSError):
+            try:
+                proc.send_signal(sig)
+            except (ProcessLookupError, OSError):
+                pass
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                pgid = os.getpgid(pid)
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                try:
+                    proc.kill()
+                except (ProcessLookupError, OSError):
+                    pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+    else:
+        try:
+            if sig == getattr(signal, "SIGKILL", 9):
+                proc.kill()
+            else:
+                proc.terminate()
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        except Exception:
+            pass
 
 
 class ManagedProcess:
@@ -187,6 +239,8 @@ class KaggleNotebookRunner:
         self.started_at = time.time()
         self.command_count = 0
         self._consecutive_hb_misses = 0
+        self._active_conn_id: Optional[str] = None
+        self._current_cmd_conn_id: Optional[str] = None
 
         self._cwd = os.getcwd()
         self._ns: Dict[str, Any] = {
@@ -200,11 +254,16 @@ class KaggleNotebookRunner:
 
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartstop = threading.Event()
+        self._stop_event = threading.Event()
+        self._command_queue: queue.Queue = queue.Queue()
+        self._command_worker_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------ #
     # Public control
     # ------------------------------------------------------------------ #
     def run(self) -> None:
+        self._stop_event.clear()
+        self._start_command_worker()
         try:
             self._run_loop()
         except KeyboardInterrupt:
@@ -215,20 +274,51 @@ class KaggleNotebookRunner:
             return
         log.info("runner shutting down")
         self.running = False
+        self.connected = False
         self._heartstop.set()
-        if self._heartbeat_thread is not None:
+        self._stop_event.set()
+        self._safe_close_ws(self.ws)
+        self._command_queue.put(None)
+        if (self._command_worker_thread is not None
+                and self._command_worker_thread.is_alive()):
+            self._command_worker_thread.join(timeout=5)
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
             self._heartbeat_thread.join(timeout=5)
         if terminate_processes:
             for p in list(self.processes.values()):
+                _kill_process_tree(p.proc, sig=15, timeout=5.0)
+
+    def _start_command_worker(self) -> None:
+        if (self._command_worker_thread is not None
+                and self._command_worker_thread.is_alive()):
+            return
+
+        def worker() -> None:
+            while self.running:
                 try:
-                    p.proc.terminate()
+                    item = self._command_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if item is None:
+                    self._command_queue.task_done()
+                    break
+                msg, conn_id = item
+                try:
+                    self._handle_command(msg, conn_id=conn_id)
                 except Exception:
-                    pass
+                    log.exception("error handling command in worker thread")
+                finally:
+                    self._command_queue.task_done()
+
+        self._command_worker_thread = threading.Thread(
+            target=worker, daemon=True, name="command-worker")
+        self._command_worker_thread.start()
 
     # ------------------------------------------------------------------ #
     # Synchronous main loop with auto-reconnect + heartbeats
     # ------------------------------------------------------------------ #
     def _run_loop(self) -> None:
+        self._start_command_worker()
         attempt = 0
         while self.running:
             attempt += 1
@@ -242,7 +332,8 @@ class KaggleNotebookRunner:
             if self.running:
                 log.info("[RECONNECT] will retry in %.1fs (attempt #%d)",
                          self.reconnect_delay, attempt)
-                time.sleep(self.reconnect_delay)
+                if self._stop_event.wait(timeout=self.reconnect_delay):
+                    break
         log.info("runner loop ended")
 
     def _connect_once(self) -> None:
@@ -260,10 +351,12 @@ class KaggleNotebookRunner:
             log.error("[CONNECT] failed to open websocket: %s (%s)",
                       type(exc).__name__, exc)
             raise
+        conn_id = uuid.uuid4().hex
         self.ws = ws
         self.connected = True
+        self._active_conn_id = conn_id
         self._consecutive_hb_misses = 0
-        log.info("[CONNECTED] websocket open to proxy %s", url)
+        log.info("[CONNECTED] websocket open to proxy %s (conn_id=%s)", url, conn_id[:8])
 
         try:
             reg = Message(
@@ -276,14 +369,20 @@ class KaggleNotebookRunner:
                 },
             )
             log.info("[REGISTER] sending register message (requested_id=%s)", reg.payload["notebook_id"])
-            self._send_ws(reg)
+            self._send_ws(reg, conn_id=conn_id)
             try:
                 raw = ws.recv(timeout=30)
             except Exception as exc:
                 log.error("[REGISTER] failed receiving register ack: %s", exc)
                 self._safe_close_ws(ws)
                 return
-            ack = Message.from_json(raw)
+            try:
+                ack = Message.from_json(raw)
+            except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+                log.error("[REGISTER] unparseable register ack: %s", exc)
+                self._safe_close_ws(ws)
+                return
+
             if ack.message_type != MessageType.REGISTER_ACK:
                 log.error("[REGISTER] register failed: %s", ack.payload)
                 self._safe_close_ws(ws)
@@ -303,11 +402,11 @@ class KaggleNotebookRunner:
             # Start heartbeat loop in a daemon thread
             self._heartstop.clear()
             self._heartbeat_thread = threading.Thread(
-                target=self._heartbeat_loop, args=(ws,), daemon=True)
+                target=self._heartbeat_loop, args=(ws, conn_id), daemon=True)
             self._heartbeat_thread.start()
             log.info("[HEARTBEAT] background heartbeat thread started (interval=%.1fs)", self.heartbeat_interval)
 
-            while self.running and self.connected:
+            while self.running and self.connected and self._active_conn_id == conn_id:
                 try:
                     raw = ws.recv(timeout=5.0)
                 except TimeoutError:
@@ -317,12 +416,12 @@ class KaggleNotebookRunner:
                     break
                 try:
                     msg = Message.from_json(raw)
-                except json.JSONDecodeError:
-                    log.warning("[RECV LOOP] unparseable message from proxy")
+                except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+                    log.warning("[RECV LOOP] unparseable message from proxy: %s", exc)
                     continue
                 log.info("[RECV] msg_type=%s id=%s corr=%s", msg.message_type.value, msg.message_id[:8], (msg.correlation_id or "-")[:8])
                 if msg.message_type == MessageType.COMMAND:
-                    self._handle_command(msg)
+                    self._command_queue.put((msg, conn_id))
                 elif msg.message_type == MessageType.HEARTBEAT_ACK:
                     self._consecutive_hb_misses = 0
         except Exception as exc:
@@ -330,12 +429,13 @@ class KaggleNotebookRunner:
                       type(exc).__name__, exc)
         finally:
             self._heartstop.set()
-            if self._heartbeat_thread is not None:
-                self._heartbeat_thread.join(timeout=5)
             self.connected = False
+            if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+                self._heartbeat_thread.join(timeout=5.0)
             self._safe_close_ws(ws)
-            self.ws = None
-            log.info("[DISCONNECTED] connection loop exited; socket closed")
+            if self.ws is ws:
+                self.ws = None
+            log.info("[DISCONNECTED] connection loop exited for conn_id=%s; socket closed", conn_id[:8])
 
     def _safe_close_ws(self, ws) -> None:
         """Safely close a WebSocket, ignoring all errors."""
@@ -346,9 +446,9 @@ class KaggleNotebookRunner:
         except Exception:
             pass
 
-    def _heartbeat_loop(self, ws) -> None:
-        while not self._heartstop.wait(timeout=self.heartbeat_interval):
-            if not self.running or not self.connected:
+    def _heartbeat_loop(self, ws, conn_id: str) -> None:
+        while not self._heartstop.is_set():
+            if not self.running or not self.connected or self._active_conn_id != conn_id:
                 log.info("[HEARTBEAT LOOP] exiting thread (running=%s, connected=%s)", self.running, self.connected)
                 break
             try:
@@ -361,18 +461,22 @@ class KaggleNotebookRunner:
                 )
                 log.info("[HEARTBEAT SEND] sending heartbeat msg_id=%s (consecutive_misses=%d)",
                          hb_msg.message_id[:8], self._consecutive_hb_misses)
-                self._send_ws(hb_msg)
+                self._send_ws(hb_msg, conn_id=conn_id)
                 self._consecutive_hb_misses += 1
-                if self._consecutive_hb_misses >= self.max_heartbeat_misses:
-                    log.warning("[HEARTBEAT] %d consecutive heartbeats without ACK; "
-                                "forcing disconnect to trigger reconnect",
-                                self._consecutive_hb_misses)
-                    self.connected = False
-                    self._safe_close_ws(self.ws)
-                    break
             except Exception as exc:
                 log.warning("[HEARTBEAT SEND FAILED] error: %s (%s)", type(exc).__name__, exc)
                 self.connected = False
+                break
+
+            if self._heartstop.wait(timeout=self.heartbeat_interval):
+                break
+
+            if self._consecutive_hb_misses >= self.max_heartbeat_misses:
+                log.warning("[HEARTBEAT] %d consecutive heartbeats without ACK; "
+                            "forcing disconnect to trigger reconnect",
+                            self._consecutive_hb_misses)
+                self.connected = False
+                self._safe_close_ws(ws)
                 break
 
     def workload(self) -> Dict[str, Any]:
@@ -392,11 +496,12 @@ class KaggleNotebookRunner:
     # ------------------------------------------------------------------ #
     # Command dispatch
     # ------------------------------------------------------------------ #
-    def _handle_command(self, msg: Message) -> None:
+    def _handle_command(self, msg: Message, conn_id: Optional[str] = None) -> None:
         payload = msg.payload or {}
         command = payload.get("command")
         self.command_count += 1
         self.current_command = {"command": command, "message_id": msg.message_id}
+        self._current_cmd_conn_id = conn_id
         log.info("command %s (%s)", command, msg.message_id[:8])
         try:
             handler = getattr(self, f"_cmd_{command}", None)
@@ -404,27 +509,32 @@ class KaggleNotebookRunner:
                 self._reply(msg, {
                     "success": False,
                     "error": f"unknown command {command!r}",
-                })
+                }, conn_id=conn_id)
                 return
             result = handler(msg)
-            if isinstance(result, dict) and result.get("success") is False:
-                pass  # synchronous return
-            self._reply(msg, result)
+            if result is not None:
+                self._reply(msg, result, conn_id=conn_id)
         except Exception as exc:
             log.exception("command %s failed", command)
             self._reply(msg, {
                 "success": False,
                 "error": f"{type(exc).__name__}: {exc}",
                 "traceback": traceback.format_exc(),
-            })
+            }, conn_id=conn_id)
         finally:
             self.current_command = None
+            self._current_cmd_conn_id = None
 
-    def _send_ws(self, message: Message) -> None:
-        if not self.connected or self.ws is None:
-            log.warning("[SEND ws FAILED] socket not connected or ws is None (connected=%s)", self.connected)
-            return
+    def _send_ws(self, message: Message, conn_id: Optional[str] = None) -> None:
         with self._ws_lock:
+            target_conn_id = conn_id if conn_id is not None else self._current_cmd_conn_id
+            if target_conn_id is not None and self._active_conn_id != target_conn_id:
+                log.warning("[SEND ws DROPPED] message for inactive connection %s (current: %s)",
+                            target_conn_id, self._active_conn_id)
+                return
+            if not self.connected or self.ws is None:
+                log.warning("[SEND ws FAILED] socket not connected or ws is None (connected=%s)", self.connected)
+                return
             try:
                 log.info("[SEND ws] type=%s id=%s corr=%s", message.message_type.value, message.message_id[:8], (message.correlation_id or "-")[:8])
                 self.ws.send(message.to_json())
@@ -434,15 +544,15 @@ class KaggleNotebookRunner:
                 self.connected = False
                 self._safe_close_ws(self.ws)
 
-    def _reply(self, msg: Message, payload: Dict[str, Any]) -> None:
-        self._send_ws(Message.create_response(msg, payload))
+    def _reply(self, msg: Message, payload: Dict[str, Any], conn_id: Optional[str] = None) -> None:
+        self._send_ws(Message.create_response(msg, payload), conn_id=conn_id)
 
-    def _stream(self, msg: Message, payload: Dict[str, Any]) -> None:
+    def _stream(self, msg: Message, payload: Dict[str, Any], conn_id: Optional[str] = None) -> None:
         self._send_ws(Message(
             message_type=MessageType.COMMAND_STREAM,
             correlation_id=msg.message_id,
             payload=payload,
-        ))
+        ), conn_id=conn_id)
 
     # ------------------------------------------------------------------ #
     # Environment helpers
@@ -673,85 +783,75 @@ class KaggleNotebookRunner:
 
     def _shell_stream(self, cmd, cwd, env, timeout, msg) -> Dict[str, Any]:
         t0 = time.time()
+        proc = None
         try:
+            popen_kwargs = _popen_kwargs()
             proc = subprocess.Popen(
                 cmd, cwd=cwd, env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                shell=True,
+                **popen_kwargs,
             )
-            out, err = [], []
+            out_lines, err_lines = [], []
+            output_queue: queue.Queue = queue.Queue()
 
-            def pump(stream, kind, buf):
-                while True:
-                    raw = stream.readline()
-                    if not raw:
-                        break
-                    line = raw.decode(errors="replace").rstrip("\n")
-                    buf.append(line)
-                    self._stream(msg, {
-                        "kind": "shell_line", "stream": kind, "line": line,
-                    })
+            def stream_reader(pipe, stream_name):
+                try:
+                    for raw in iter(pipe.readline, b""):
+                        line = raw.decode(errors="replace").rstrip("\n")
+                        output_queue.put((stream_name, line))
+                    pipe.close()
+                except Exception:
+                    pass
+                finally:
+                    output_queue.put((stream_name, None))
 
-            import select
+            t_out = threading.Thread(target=stream_reader, args=(proc.stdout, "stdout"), daemon=True)
+            t_err = threading.Thread(target=stream_reader, args=(proc.stderr, "stderr"), daemon=True)
+            t_out.start()
+            t_err.start()
+
+            active_streams = 2
             deadline = (time.time() + timeout) if timeout is not None else None
-            while True:
+
+            while active_streams > 0:
                 if deadline is not None and time.time() > deadline:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except Exception:
-                        proc.kill()
+                    _kill_process_tree(proc, sig=15, timeout=5.0)
                     return {
                         "success": False, "error": f"timed out after {timeout}s",
                         "exit_code": -1, "execution_time": round(time.time() - t0, 3),
                     }
-                r, _, _ = select.select([proc.stdout, proc.stderr], [], [], 0.1)
-                if proc.stdout in r:
-                    raw = proc.stdout.readline()
-                    if not raw:
-                        pass
-                    else:
-                        line = raw.decode(errors="replace").rstrip("\n")
-                        out.append(line)
-                        self._stream(msg, {
-                            "kind": "shell_line", "stream": "stdout", "line": line,
-                        })
-                if proc.stderr in r:
-                    raw = proc.stderr.readline()
-                    if not raw:
-                        pass
-                    else:
-                        line = raw.decode(errors="replace").rstrip("\n")
-                        err.append(line)
-                        self._stream(msg, {
-                            "kind": "shell_line", "stream": "stderr", "line": line,
-                        })
-                if proc.poll() is not None:
-                    break
-
-            # Read remaining output
-            for stream, buf in [(proc.stdout, out), (proc.stderr, err)]:
-                while True:
-                    raw = stream.readline()
-                    if not raw:
+                try:
+                    kind, line = output_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if proc.poll() is not None and not t_out.is_alive() and not t_err.is_alive():
                         break
-                    line = raw.decode(errors="replace").rstrip("\n")
-                    buf.append(line)
+                    continue
+
+                if line is None:
+                    active_streams -= 1
+                else:
+                    if kind == "stdout":
+                        out_lines.append(line)
+                    else:
+                        err_lines.append(line)
+                    self._stream(msg, {
+                        "kind": "shell_line", "stream": kind, "line": line,
+                    })
 
             rc = proc.wait()
             return {
                 "success": rc == 0,
-                "stdout": "\n".join(out),
-                "stderr": "\n".join(err),
+                "stdout": "\n".join(out_lines),
+                "stderr": "\n".join(err_lines),
                 "exit_code": rc,
                 "execution_time": round(time.time() - t0, 3),
                 "streamed": True,
             }
         except Exception as exc:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
+            if proc is not None:
+                _kill_process_tree(proc, sig=15, timeout=5.0)
             return {
                 "success": False, "error": f"{type(exc).__name__}: {exc}",
                 "exit_code": -1, "execution_time": round(time.time() - t0, 3),
@@ -767,10 +867,13 @@ class KaggleNotebookRunner:
         cwd = self._resolve(payload.get("cwd") or ".", self._cwd)
         env = self._merged_env(payload.get("env"))
 
+        popen_kwargs = _popen_kwargs()
         proc = subprocess.Popen(
             cmd, cwd=cwd, env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            shell=True,
+            **popen_kwargs,
         )
         managed = ManagedProcess(process_id, cmd, proc, cwd, env, log)
         with self._proc_lock:
@@ -786,19 +889,16 @@ class KaggleNotebookRunner:
                         "error": f"unknown process_id {process_id!r}"}
             old = existing
             del self.processes[process_id]
-        try:
-            old.proc.terminate()
-        except Exception:
-            pass
-        try:
-            old.proc.wait(timeout=5)
-        except Exception:
-            pass
 
+        _kill_process_tree(old.proc, sig=15, timeout=5.0)
+
+        popen_kwargs = _popen_kwargs()
         proc = subprocess.Popen(
             old.command, cwd=old.cwd, env=old.env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            shell=True,
+            **popen_kwargs,
         )
         managed = ManagedProcess(process_id, old.command, proc, old.cwd,
                                  old.env, log, restart_count=old.restart_count + 1)
@@ -813,17 +913,7 @@ class KaggleNotebookRunner:
             mp = self.processes.get(process_id)
         if mp is None:
             return {"success": False, "error": f"unknown process_id {process_id!r}"}
-        try:
-            if sig == 15:
-                mp.proc.terminate()
-            else:
-                import os
-                os.kill(mp.proc.pid, sig)
-            mp.proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            mp.proc.kill()
-        except Exception:
-            pass
+        _kill_process_tree(mp.proc, sig=sig, timeout=10.0)
         mp.check()
         return {"success": True, "process": mp.info()}
 
@@ -862,15 +952,8 @@ class KaggleNotebookRunner:
         if mp is None:
             return {"success": False, "error": f"unknown process_id {process_id!r}"}
         try:
-            if timeout:
-                try:
-                    import select
-                    select.select([], [], [], timeout)
-                except Exception:
-                    pass
-            else:
-                mp.proc.wait()
-        except Exception:
+            mp.proc.wait(timeout=timeout)
+        except (subprocess.TimeoutExpired, Exception):
             pass
         mp.check()
         return {"success": True, "process": mp.info()}

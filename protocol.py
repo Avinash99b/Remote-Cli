@@ -59,6 +59,7 @@ class CommandType(Enum):
     
     # Process management
     PROCESS_START = "process_start"
+    PROCESS_RESTART = "process_restart"
     PROCESS_TERMINATE = "process_terminate"
     PROCESS_LIST = "process_list"
     PROCESS_LOGS = "process_logs"
@@ -118,8 +119,14 @@ class Message:
     def from_json(cls, json_str: str) -> 'Message':
         """Deserialize message from JSON."""
         data = json.loads(json_str)
+        if not isinstance(data, dict):
+            raise ValueError("JSON root must be an object")
+        if 'message_type' not in data:
+            raise KeyError("missing 'message_type' key in message JSON")
         data['message_type'] = MessageType(data['message_type'])
-        return cls(**data)
+        valid_keys = {'message_id', 'message_type', 'timestamp', 'correlation_id', 'payload'}
+        filtered = {k: v for k, v in data.items() if k in valid_keys}
+        return cls(**filtered)
     
     @classmethod
     def create_response(cls, request: 'Message', payload: Dict[str, Any], 

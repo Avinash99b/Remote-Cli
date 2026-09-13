@@ -110,6 +110,8 @@ class NotebookConnection:
 class TestingProxy:
     """The persistent coordinator between managers and notebook runners."""
 
+    __test__ = False
+
     def __init__(self, host: str, port: int, token: Optional[str] = None,
                  heartbeat_timeout: float = 60.0, queue_max: int = 100,
                  monitor_interval: float = 5.0) -> None:
@@ -188,22 +190,23 @@ class TestingProxy:
             try:
                 await asyncio.sleep(self.monitor_interval)
                 now = time.time()
-                for nb in list(self.notebooks.values()):
-                    try:
-                        if nb.connected and (now - nb.last_heartbeat) > self.heartbeat_timeout:
-                            nb.status = "disconnected"
-                            nb.connected = False
-                            if nb.ws is not None:
-                                old_ws = nb.ws
-                                nb.ws = None
-                                asyncio.create_task(self._close(old_ws, 1001, "heartbeat timeout"))
-                            log.warning(
-                                "notebook %s heartbeat stale (%.1fs) -> disconnected",
-                                nb.notebook_id, now - nb.last_heartbeat,
-                            )
-                    except Exception as exc:
-                        log.error("[MONITOR] error checking notebook %s: %s",
-                                  nb.notebook_id, exc)
+                async with self._lock:
+                    for nb in list(self.notebooks.values()):
+                        try:
+                            if nb.connected and (now - nb.last_heartbeat) > self.heartbeat_timeout:
+                                nb.status = "disconnected"
+                                nb.connected = False
+                                if nb.ws is not None:
+                                    old_ws = nb.ws
+                                    nb.ws = None
+                                    asyncio.create_task(self._close(old_ws, 1001, "heartbeat timeout"))
+                                log.warning(
+                                    "notebook %s heartbeat stale (%.1fs) -> disconnected",
+                                    nb.notebook_id, now - nb.last_heartbeat,
+                                )
+                        except Exception as exc:
+                            log.error("[MONITOR] error checking notebook %s: %s",
+                                      nb.notebook_id, exc)
                 await self._gc_pending()
             except asyncio.CancelledError:
                 break
@@ -211,9 +214,12 @@ class TestingProxy:
                 log.error("[MONITOR] unexpected error in monitor loop: %s (%s)",
                           type(exc).__name__, exc)
 
-    async def _gc_pending(self) -> None:
+    async def _gc_pending(self, ttl: float = 300.0) -> None:
+        now = time.time()
         async with self._lock:
-            dead = [c for c, m in self.pending.items() if m not in self.managers]
+            dead = [c for c, entry in self.pending.items()
+                    if (isinstance(entry, tuple) and (entry[0] not in self.managers or (now - entry[1]) > ttl))
+                    or (not isinstance(entry, tuple) and entry not in self.managers)]
             for c in dead:
                 del self.pending[c]
 
@@ -286,8 +292,8 @@ class TestingProxy:
 
         try:
             reg = Message.from_json(raw)
-        except json.JSONDecodeError:
-            log.warning("unparseable register message from notebook")
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+            log.warning("unparseable register message from notebook: %s", exc)
             await self._close(ws, 1008, "unparseable register message")
             return
 
@@ -367,8 +373,8 @@ class TestingProxy:
             async for raw in ws:
                 try:
                     msg = Message.from_json(raw)
-                except json.JSONDecodeError:
-                    log.warning("unparseable message from notebook %s", nb.notebook_id)
+                except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+                    log.warning("unparseable message from notebook %s: %s", nb.notebook_id, exc)
                     continue
                 log.info("[RECV notebook %s] msg_type=%s id=%s corr=%s",
                          nb.notebook_id, msg.message_type.value, msg.message_id[:8], (msg.correlation_id or "-")[:8])
@@ -384,8 +390,8 @@ class TestingProxy:
             log.warning("notebook %s connection loop error: %s (%s)",
                         nb.notebook_id, type(exc).__name__, exc)
         finally:
-            nb.status = "disconnected"
             if nb.ws is ws:
+                nb.status = "disconnected"
                 nb.connected = False
                 nb.ws = None
             log.info("notebook connection closed: %s (connected=%s)", nb.notebook_id, nb.connected)
@@ -417,9 +423,10 @@ class TestingProxy:
     async def _route_notebook_response(self, nb: NotebookConnection, msg: Message) -> None:
         corr = msg.correlation_id
         async with self._lock:
-            mgr_id = self.pending.get(corr)
-        if mgr_id is None:
+            entry = self.pending.get(corr)
+        if entry is None:
             return
+        mgr_id = entry[0] if isinstance(entry, tuple) else entry
         mgr_ws = self.managers.get(mgr_id)
         if mgr_ws is None:
             async with self._lock:
@@ -441,8 +448,8 @@ class TestingProxy:
             async for raw in ws:
                 try:
                     msg = Message.from_json(raw)
-                except json.JSONDecodeError:
-                    log.warning("[MANAGER %s] unparseable message", mgr_id)
+                except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+                    log.warning("[MANAGER %s] unparseable message: %s", mgr_id, exc)
                     continue
                 try:
                     await self._handle_manager_message(mgr_id, ws, msg)
@@ -458,7 +465,8 @@ class TestingProxy:
         finally:
             self.managers.pop(mgr_id, None)
             async with self._lock:
-                dead = [c for c, m in self.pending.items() if m == mgr_id]
+                dead = [c for c, entry in self.pending.items()
+                        if (entry[0] if isinstance(entry, tuple) else entry) == mgr_id]
                 for c in dead:
                     del self.pending[c]
             log.info("manager %s disconnected (%d active)", mgr_id, len(self.managers))
@@ -502,6 +510,7 @@ class TestingProxy:
         crafted = None
         if command == CommandType.PROXY_LIST.value:
             crafted = Message.create_response(msg, {
+                "success": True,
                 "notebooks": [nb.summary() for nb in self.notebooks.values()],
             })
         elif command == CommandType.PROXY_INFO.value:
@@ -517,7 +526,7 @@ class TestingProxy:
         elif command == CommandType.PROXY_HEARTBEAT.value:
             connected = sum(1 for nb in self.notebooks.values() if nb.connected)
             crafted = Message.create_response(msg, {
-                "status": "ok", "server_time": time.time(),
+                "success": True, "status": "ok", "server_time": time.time(),
                 "uptime_seconds": round(time.time() - self.started_at, 2),
                 "notebooks_total": len(self.notebooks),
                 "notebooks_connected": connected,
@@ -525,6 +534,7 @@ class TestingProxy:
         elif command == CommandType.PROXY_STATS.value:
             connected = sum(1 for nb in self.notebooks.values() if nb.connected)
             crafted = Message.create_response(msg, {
+                "success": True,
                 "uptime_seconds": round(time.time() - self.started_at, 2),
                 "notebooks_total": len(self.notebooks),
                 "notebooks_connected": connected,
@@ -560,7 +570,7 @@ class TestingProxy:
                  corr[:8], notebook_id, nb.connected, nb.ws is not None, hb_age, len(nb.pending_queue))
 
         async with self._lock:
-            self.pending[corr] = mgr_id
+            self.pending[corr] = (mgr_id, time.time())
             self.total_commands += 1
             if nb.connected and nb.ws is not None:
                 target_ws = nb.ws

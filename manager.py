@@ -158,7 +158,11 @@ class InferenceClientManager:
                 log.warning("[MANAGER TIMEOUT] no response within %.1fs (corr_id=%s)", eff_timeout, corr_id[:8])
                 raise TimeoutError(
                     f"no response within {eff_timeout}s")
-            rmsg = Message.from_json(raw)
+            try:
+                rmsg = Message.from_json(raw)
+            except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+                log.warning("[MANAGER RECV] unparseable message: %s", exc)
+                continue
             if rmsg.correlation_id != corr_id:
                 continue
             log.info("[MANAGER RECV] msg_type=%s corr_id=%s payload=%s", rmsg.message_type.value, corr_id[:8], rmsg.payload)
@@ -237,7 +241,11 @@ class InferenceClientManager:
             while True:
                 raw = await asyncio.wait_for(
                     ws.recv(), timeout=self.timeout)
-                rmsg = Message.from_json(raw)
+                try:
+                    rmsg = Message.from_json(raw)
+                except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+                    log.warning("[MANAGER PULL] unparseable message: %s", exc)
+                    continue
                 if rmsg.correlation_id != msg.message_id:
                     continue
                 if rmsg.message_type == MessageType.COMMAND_STREAM:
