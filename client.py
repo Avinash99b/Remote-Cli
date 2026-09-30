@@ -48,6 +48,7 @@ Usage
 
 import argparse
 import base64
+import collections
 import contextlib
 import hashlib
 import io
@@ -147,8 +148,11 @@ def _kill_process_tree(proc: subprocess.Popen, sig: int = 15, timeout: float = 5
 class ManagedProcess:
     """A long-running subprocess with captured output buffers."""
 
+    MAX_CAPTURED_LINES = 100000
+
     def __init__(self, process_id: str, command: str, proc: subprocess.Popen,
-                 cwd: str, env: Dict[str, str], logger, restart_count: int = 0) -> None:
+                 cwd: str, env: Dict[str, str], logger, restart_count: int = 0,
+                 subscribers: Optional[List[Any]] = None) -> None:
         self.process_id = process_id
         self.command = command
         self.proc = proc
@@ -160,28 +164,72 @@ class ManagedProcess:
         self.end_time: Optional[float] = None
         self.exit_code: Optional[int] = None
         self.restart_count = restart_count
-        self.stdout_lines: List[str] = []
-        self.stderr_lines: List[str] = []
+        self.stdout_lines: "collections.deque" = collections.deque(
+            maxlen=self.MAX_CAPTURED_LINES)
+        self.stderr_lines: "collections.deque" = collections.deque(
+            maxlen=self.MAX_CAPTURED_LINES)
+        self.stdout_total = 0
+        self.stderr_total = 0
         self._lock = threading.Lock()
         self._threads: List[threading.Thread] = []
+        self._done = threading.Event()
+        # Subscribers must be registered before the pump threads start so the
+        # very first output lines are not missed.
+        self._line_subscribers: List[Any] = list(subscribers or [])
         if proc.stdout is not None:
             self._start_pump(proc.stdout, self.stdout_lines, "stdout")
         if proc.stderr is not None:
             self._start_pump(proc.stderr, self.stderr_lines, "stderr")
+        self._watch_thread = threading.Thread(
+            target=self._watch, daemon=True, name="proc-watch")
+        self._watch_thread.start()
 
-    def _start_pump(self, stream, buf: List[str], tag: str) -> None:
+    def _start_pump(self, stream, buf, tag: str) -> None:
         def _pump():
             try:
                 for raw in iter(stream.readline, b""):
                     line = raw.decode(errors="replace").rstrip("\n")
                     with self._lock:
                         buf.append(line)
+                        if tag == "stdout":
+                            self.stdout_total += 1
+                        else:
+                            self.stderr_total += 1
+                        subscribers = list(self._line_subscribers)
+                    for cb in subscribers:
+                        try:
+                            cb(tag, line)
+                        except Exception:
+                            pass
                 stream.close()
             except Exception as exc:  # pragma: no cover
                 self.logger.debug("pump %s error: %s", tag, exc)
         t = threading.Thread(target=_pump, daemon=True)
         t.start()
         self._threads.append(t)
+
+    def _watch(self) -> None:
+        try:
+            self.proc.wait()
+        except Exception:  # pragma: no cover
+            pass
+        # Drain the reader pumps so no trailing output is lost before callers
+        # observe the process as finished.
+        for t in self._threads:
+            t.join(timeout=5.0)
+        self.check()
+        self._done.set()
+
+    def subscribe_lines(self, callback) -> None:
+        with self._lock:
+            self._line_subscribers.append(callback)
+
+    def unsubscribe_lines(self, callback) -> None:
+        with self._lock:
+            try:
+                self._line_subscribers.remove(callback)
+            except ValueError:
+                pass
 
     def check(self) -> None:
         if self.status == "running":
@@ -191,9 +239,38 @@ class ManagedProcess:
                 self.exit_code = rc
                 self.end_time = time.time()
 
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        finished = self._done.wait(timeout=timeout)
+        self.check()
+        return finished
+
+    def snapshot(self, tail: Optional[int] = 200) -> Dict[str, Any]:
+        self.check()
+        with self._lock:
+            if tail is None or tail <= 0:
+                out = list(self.stdout_lines)
+                err = list(self.stderr_lines)
+            else:
+                out = list(self.stdout_lines)[-tail:]
+                err = list(self.stderr_lines)[-tail:]
+            stdout_total = self.stdout_total
+            stderr_total = self.stderr_total
+        return {
+            "success": True,
+            "process": self.info(),
+            "stdout": "\n".join(out),
+            "stderr": "\n".join(err),
+            "stdout_tail": len(out),
+            "stderr_tail": len(err),
+            "stdout_total": stdout_total,
+            "stderr_total": stderr_total,
+            "complete": self.status != "running",
+        }
+
     def info(self) -> Dict[str, Any]:
         self.check()
         return {
+            "job_id": self.process_id,
             "process_id": self.process_id,
             "command": self.command,
             "status": self.status,
@@ -235,12 +312,11 @@ class KaggleNotebookRunner:
         self.notebook_id: Optional[str] = None
         self.secret: Optional[str] = None
         self.ws = None
-        self.current_command: Optional[Dict[str, Any]] = None
         self.started_at = time.time()
         self.command_count = 0
         self._consecutive_hb_misses = 0
         self._active_conn_id: Optional[str] = None
-        self._current_cmd_conn_id: Optional[str] = None
+        self._cmd_conn_tls = threading.local()
 
         self._cwd = os.getcwd()
         self._ns: Dict[str, Any] = {
@@ -249,8 +325,10 @@ class KaggleNotebookRunner:
         }
         self.processes: Dict[str, ManagedProcess] = {}
         self._upload_buffers: Dict[str, Dict[str, Any]] = {}
+        self._active_commands: Dict[str, str] = {}
         self._proc_lock = threading.Lock()
         self._ws_lock = threading.Lock()
+        self._cmd_lock = threading.Lock()
 
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartstop = threading.Event()
@@ -303,12 +381,13 @@ class KaggleNotebookRunner:
                     self._command_queue.task_done()
                     break
                 msg, conn_id = item
-                try:
-                    self._handle_command(msg, conn_id=conn_id)
-                except Exception:
-                    log.exception("error handling command in worker thread")
-                finally:
-                    self._command_queue.task_done()
+                # Run every command on its own thread so a slow/blocking
+                # command cannot stall the commands behind it.
+                t = threading.Thread(
+                    target=self._handle_command, args=(msg,), kwargs={"conn_id": conn_id},
+                    daemon=True, name=f"cmd-{msg.message_id[:8]}")
+                t.start()
+                self._command_queue.task_done()
 
         self._command_worker_thread = threading.Thread(
             target=worker, daemon=True, name="command-worker")
@@ -486,10 +565,13 @@ class KaggleNotebookRunner:
                 p.check()
                 if p.status == "running":
                     running += 1
+        with self._cmd_lock:
+            active = list(self._active_commands.values())
         return {
             "running_processes": running,
             "total_processes": len(self.processes),
-            "current_command": self.current_command,
+            "current_command": active[-1] if active else None,
+            "active_commands": active,
             "commands_served": self.command_count,
         }
 
@@ -500,8 +582,9 @@ class KaggleNotebookRunner:
         payload = msg.payload or {}
         command = payload.get("command")
         self.command_count += 1
-        self.current_command = {"command": command, "message_id": msg.message_id}
-        self._current_cmd_conn_id = conn_id
+        with self._cmd_lock:
+            self._active_commands[msg.message_id] = command
+        self._cmd_conn_tls.conn_id = conn_id
         log.info("command %s (%s)", command, msg.message_id[:8])
         try:
             handler = getattr(self, f"_cmd_{command}", None)
@@ -522,12 +605,15 @@ class KaggleNotebookRunner:
                 "traceback": traceback.format_exc(),
             }, conn_id=conn_id)
         finally:
-            self.current_command = None
-            self._current_cmd_conn_id = None
+            with self._cmd_lock:
+                self._active_commands.pop(msg.message_id, None)
+            self._cmd_conn_tls.conn_id = None
 
     def _send_ws(self, message: Message, conn_id: Optional[str] = None) -> None:
         with self._ws_lock:
-            target_conn_id = conn_id if conn_id is not None else self._current_cmd_conn_id
+            if conn_id is None:
+                conn_id = getattr(self._cmd_conn_tls, "conn_id", None)
+            target_conn_id = conn_id
             if target_conn_id is not None and self._active_conn_id != target_conn_id:
                 log.warning("[SEND ws DROPPED] message for inactive connection %s (current: %s)",
                             target_conn_id, self._active_conn_id)
@@ -743,7 +829,24 @@ class KaggleNotebookRunner:
     # ------------------------------------------------------------------ #
     # Shell execution
     # ------------------------------------------------------------------ #
+    DEFAULT_SHELL_WAIT = 30.0
+
     def _cmd_shell_exec(self, msg: Message) -> Dict[str, Any]:
+        """Run a shell command as a background job.
+
+        The command always runs in its own subprocess so a hung command (e.g.
+        an interactive ``ssh``/``git`` host-key prompt) can never block other
+        commands. How long *this* request waits for the result:
+
+          * ``timeout`` set  -> wait up to that many seconds, then kill the
+            job and return its output.
+          * ``timeout`` unset -> wait up to ``wait`` seconds (default 30s);
+            if the command is still running, return a ``job_id`` immediately
+            so the caller can fetch output later via the ``job_*`` commands.
+
+        If ``stream`` is true, output lines are pushed to the manager while
+        the request is waiting.
+        """
         payload = msg.payload
         cmd = payload["shell_command"]
         cwd = self._resolve(payload.get("cwd") or ".", self._cwd)
@@ -751,37 +854,13 @@ class KaggleNotebookRunner:
         timeout = payload.get("timeout")
         stream = payload.get("stream", False)
 
-        if stream:
-            return self._shell_stream(cmd, cwd, env, timeout, msg)
+        if timeout is not None:
+            wait_budget = float(timeout)
+        elif payload.get("wait") is not None:
+            wait_budget = float(payload["wait"])
+        else:
+            wait_budget = self.DEFAULT_SHELL_WAIT
 
-        t0 = time.time()
-        try:
-            completed = subprocess.run(
-                cmd, shell=True, cwd=cwd, env=env,
-                capture_output=True, text=True, timeout=timeout)
-            return {
-                "success": completed.returncode == 0,
-                "stdout": completed.stdout,
-                "stderr": completed.stderr,
-                "exit_code": completed.returncode,
-                "execution_time": round(time.time() - t0, 3),
-            }
-        except subprocess.TimeoutExpired as exc:
-            return {
-                "success": False,
-                "stdout": (exc.stdout or ""),
-                "stderr": (exc.stderr or "") + "\n[timed out after "
-                          f"{timeout}s]",
-                "exit_code": -1,
-                "execution_time": round(time.time() - t0, 3),
-                "error": f"timed out after {timeout}s",
-            }
-        except Exception as exc:
-            return {"success": False, "error": f"{type(exc).__name__}: {exc}",
-                    "exit_code": -1,
-                    "execution_time": round(time.time() - t0, 3)}
-
-    def _shell_stream(self, cmd, cwd, env, timeout, msg) -> Dict[str, Any]:
         t0 = time.time()
         proc = None
         try:
@@ -793,69 +872,169 @@ class KaggleNotebookRunner:
                 shell=True,
                 **popen_kwargs,
             )
-            out_lines, err_lines = [], []
-            output_queue: queue.Queue = queue.Queue()
-
-            def stream_reader(pipe, stream_name):
-                try:
-                    for raw in iter(pipe.readline, b""):
-                        line = raw.decode(errors="replace").rstrip("\n")
-                        output_queue.put((stream_name, line))
-                    pipe.close()
-                except Exception:
-                    pass
-                finally:
-                    output_queue.put((stream_name, None))
-
-            t_out = threading.Thread(target=stream_reader, args=(proc.stdout, "stdout"), daemon=True)
-            t_err = threading.Thread(target=stream_reader, args=(proc.stderr, "stderr"), daemon=True)
-            t_out.start()
-            t_err.start()
-
-            active_streams = 2
-            deadline = (time.time() + timeout) if timeout is not None else None
-
-            while active_streams > 0:
-                if deadline is not None and time.time() > deadline:
-                    _kill_process_tree(proc, sig=15, timeout=5.0)
-                    return {
-                        "success": False, "error": f"timed out after {timeout}s",
-                        "exit_code": -1, "execution_time": round(time.time() - t0, 3),
-                    }
-                try:
-                    kind, line = output_queue.get(timeout=0.1)
-                except queue.Empty:
-                    if proc.poll() is not None and not t_out.is_alive() and not t_err.is_alive():
-                        break
-                    continue
-
-                if line is None:
-                    active_streams -= 1
-                else:
-                    if kind == "stdout":
-                        out_lines.append(line)
-                    else:
-                        err_lines.append(line)
-                    self._stream(msg, {
-                        "kind": "shell_line", "stream": kind, "line": line,
-                    })
-
-            rc = proc.wait()
-            return {
-                "success": rc == 0,
-                "stdout": "\n".join(out_lines),
-                "stderr": "\n".join(err_lines),
-                "exit_code": rc,
-                "execution_time": round(time.time() - t0, 3),
-                "streamed": True,
-            }
         except Exception as exc:
-            if proc is not None:
+            return {"success": False, "error": f"{type(exc).__name__}: {exc}",
+                    "exit_code": -1,
+                    "execution_time": round(time.time() - t0, 3)}
+
+        job_id = payload.get("process_id") or ("job-" + uuid.uuid4().hex[:12])
+        on_line = None
+        if stream:
+            cmd_conn_id = getattr(self._cmd_conn_tls, "conn_id", None)
+
+            def on_line(tag: str, line: str) -> None:
+                self._stream(msg, {
+                    "kind": "shell_line", "stream": tag, "line": line,
+                }, conn_id=cmd_conn_id)
+
+        managed = ManagedProcess(
+            job_id, cmd, proc, cwd, env, log,
+            subscribers=[on_line] if on_line else None)
+        with self._proc_lock:
+            self.processes[job_id] = managed
+        self._prune_jobs()
+
+        finished = managed.wait(timeout=wait_budget)
+
+        if on_line is not None:
+            managed.unsubscribe_lines(on_line)
+
+        elapsed = round(time.time() - t0, 3)
+
+        if not finished:
+            if timeout is not None:
                 _kill_process_tree(proc, sig=15, timeout=5.0)
-            return {
-                "success": False, "error": f"{type(exc).__name__}: {exc}",
-                "exit_code": -1, "execution_time": round(time.time() - t0, 3),
-            }
+                managed.check()
+                snap = managed.snapshot(tail=None)
+                snap.update({
+                    "success": False,
+                    "exit_code": -1,
+                    "execution_time": elapsed,
+                    "error": f"timed out after {timeout}s",
+                    "job_id": job_id,
+                })
+                return snap
+            snap = managed.snapshot(tail=None)
+            snap.update({
+                "success": True,
+                "status": "running",
+                "job_id": job_id,
+                "execution_time": elapsed,
+                "message": (f"command still running after {wait_budget}s; "
+                            f"fetch output with job_logs/job_wait (job_id={job_id})"),
+            })
+            return snap
+
+        managed.check()
+        snap = managed.snapshot(tail=None)
+        snap.update({
+            "success": managed.exit_code == 0,
+            "exit_code": managed.exit_code,
+            "execution_time": elapsed,
+            "job_id": job_id,
+        })
+        if stream:
+            snap["streamed"] = True
+        return snap
+
+    # ------------------------------------------------------------------ #
+    # Background job management
+    # ------------------------------------------------------------------ #
+    def _prune_jobs(self, max_finished: int = 100) -> None:
+        """Drop oldest finished shell jobs once the backlog grows too large.
+
+        Only auto-created ``job-*`` entries are pruned; explicit managed
+        processes started via ``process_start`` (possibly user services) are
+        never removed.
+        """
+        finished = []
+        with self._proc_lock:
+            for jid, mp in self.processes.items():
+                if not jid.startswith("job-"):
+                    continue
+                mp.check()
+                if mp.status != "running":
+                    finished.append((mp.end_time or mp.start_time, jid))
+            if len(finished) <= max_finished:
+                return
+            finished.sort()
+            for _ts, jid in finished[:len(finished) - max_finished]:
+                self.processes.pop(jid, None)
+
+    def _cmd_job_list(self, msg: Message) -> Dict[str, Any]:
+        jobs = []
+        with self._proc_lock:
+            for p in self.processes.values():
+                p.check()
+                jobs.append(p.info())
+        return {"success": True, "jobs": jobs, "processes": jobs}
+
+    def _cmd_job_info(self, msg: Message) -> Dict[str, Any]:
+        job_id = msg.payload["job_id"]
+        with self._proc_lock:
+            mp = self.processes.get(job_id)
+        if mp is None:
+            return {"success": False, "error": f"unknown job_id {job_id!r}"}
+        info = mp.info()
+        return {"success": True, "job": info, "process": info}
+
+    def _cmd_job_logs(self, msg: Message) -> Dict[str, Any]:
+        job_id = msg.payload["job_id"]
+        tail = int(msg.payload.get("tail", 200))
+        with self._proc_lock:
+            mp = self.processes.get(job_id)
+        if mp is None:
+            return {"success": False, "error": f"unknown job_id {job_id!r}"}
+        snap = mp.snapshot(tail=tail)
+        snap["job_id"] = job_id
+        return snap
+
+    def _cmd_job_wait(self, msg: Message) -> Dict[str, Any]:
+        job_id = msg.payload["job_id"]
+        timeout = msg.payload.get("timeout")
+        timeout = float(timeout) if timeout is not None else None
+        kill_on_timeout = msg.payload.get("kill_on_timeout", False)
+        with self._proc_lock:
+            mp = self.processes.get(job_id)
+        if mp is None:
+            return {"success": False, "error": f"unknown job_id {job_id!r}"}
+
+        t0 = time.time()
+        finished = mp.wait(timeout=timeout)
+        was_timeout = not finished
+        if was_timeout and kill_on_timeout:
+            _kill_process_tree(mp.proc, sig=15, timeout=5.0)
+            mp.check()
+            finished = True
+
+        snap = mp.snapshot(tail=None)
+        snap.update({
+            "job_id": job_id,
+            "execution_time": round(time.time() - t0, 3),
+            "timed_out": was_timeout,
+        })
+        if not finished:
+            snap["success"] = True
+            snap["status"] = "running"
+        else:
+            snap["success"] = mp.exit_code == 0
+            snap["exit_code"] = mp.exit_code
+        if was_timeout and kill_on_timeout:
+            snap["error"] = f"timed out after {timeout}s (killed)"
+        return snap
+
+    def _cmd_job_terminate(self, msg: Message) -> Dict[str, Any]:
+        job_id = msg.payload["job_id"]
+        sig = msg.payload.get("signal", 15)
+        with self._proc_lock:
+            mp = self.processes.get(job_id)
+        if mp is None:
+            return {"success": False, "error": f"unknown job_id {job_id!r}"}
+        _kill_process_tree(mp.proc, sig=sig, timeout=10.0)
+        mp.check()
+        snap = mp.snapshot()
+        snap["job_id"] = job_id
+        return snap
 
     # ------------------------------------------------------------------ #
     # Process management
@@ -933,8 +1112,8 @@ class KaggleNotebookRunner:
         if mp is None:
             return {"success": False, "error": f"unknown process_id {process_id!r}"}
         with mp._lock:
-            out = mp.stdout_lines[-tail:]
-            err = mp.stderr_lines[-tail:]
+            out = list(mp.stdout_lines)[-tail:]
+            err = list(mp.stderr_lines)[-tail:]
         return {
             "success": True,
             "process_id": process_id,

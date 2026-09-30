@@ -65,7 +65,7 @@ def test_shell_stream_string_cmd():
         runner._cwd = tmpdir
         
         streamed_lines = []
-        def mock_stream(msg, payload):
+        def mock_stream(msg, payload, **kwargs):
             if payload.get("kind") == "shell_line":
                 streamed_lines.append(payload.get("line"))
 
@@ -266,6 +266,119 @@ def test_malformed_message_parsing_errors():
     # Invalid message_type enum -> ValueError
     with pytest.raises((json.JSONDecodeError, ValueError, KeyError, TypeError)):
         Message.from_json(json.dumps({"message_type": "invalid_type"}))
+
+
+@pytest.mark.asyncio
+async def test_blocking_command_does_not_stall_others():
+    port = 18769
+    proxy = TestingProxy(host="127.0.0.1", port=port, heartbeat_timeout=5.0)
+    server_task = asyncio.create_task(proxy.serve_forever())
+    await asyncio.sleep(0.2)
+
+    runner = KaggleNotebookRunner(
+        proxy_url=f"ws://127.0.0.1:{port}/notebook",
+        notebook_id="block-nb",
+        heartbeat_interval=0.5,
+    )
+    import threading
+    t = threading.Thread(target=runner.run, daemon=True)
+    t.start()
+    await asyncio.sleep(0.5)
+
+    mgr = InferenceClientManager(proxy_url=f"ws://127.0.0.1:{port}/manager")
+    try:
+        # A command that blocks for far longer than the manager would tolerate.
+        async def blocking():
+            return await mgr.request("shell_exec", notebook_id="block-nb", extra={
+                "shell_command": "sleep 30 && echo done",
+            }, timeout=5.0)
+
+        block_task = asyncio.create_task(blocking())
+        await asyncio.sleep(0.4)
+
+        # A second command must still be served promptly despite the first
+        # command's worker thread being blocked.
+        start_t = time.time()
+        res = await mgr.request("pwd", notebook_id="block-nb", timeout=5.0)
+        elapsed = time.time() - start_t
+        assert res["success"] is True
+        assert "cwd" in res
+        assert elapsed < 3.0
+
+        block_task.cancel()
+        try:
+            await block_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+        # Clean up the still-running remote job.
+        jobs = await mgr.request("job_list", notebook_id="block-nb", timeout=5.0)
+        for job in jobs.get("jobs", []):
+            if job.get("status") == "running":
+                await mgr.request("job_terminate", notebook_id="block-nb", extra={
+                    "job_id": job["process_id"],
+                }, timeout=5.0)
+    finally:
+        runner.shutdown()
+        proxy._request_shutdown()
+        server_task.cancel()
+        try:
+            await server_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_shell_job_returns_id_and_output_fetchable():
+    port = 18770
+    proxy = TestingProxy(host="127.0.0.1", port=port, heartbeat_timeout=5.0)
+    server_task = asyncio.create_task(proxy.serve_forever())
+    await asyncio.sleep(0.2)
+
+    runner = KaggleNotebookRunner(
+        proxy_url=f"ws://127.0.0.1:{port}/notebook",
+        notebook_id="job-nb",
+        heartbeat_interval=0.5,
+    )
+    import threading
+    t = threading.Thread(target=runner.run, daemon=True)
+    t.start()
+    await asyncio.sleep(0.5)
+
+    mgr = InferenceClientManager(proxy_url=f"ws://127.0.0.1:{port}/manager")
+    try:
+        res = await mgr.request("shell_exec", notebook_id="job-nb", extra={
+            "shell_command": "sleep 1.5 && echo job_output_marker",
+            "wait": 0.5,
+        }, timeout=5.0)
+        assert res["success"] is True
+        assert res.get("status") == "running"
+        job_id = res["job_id"]
+        assert job_id
+
+        jobs = await mgr.request("job_list", notebook_id="job-nb", timeout=5.0)
+        assert jobs["success"] is True
+        assert any(j["process_id"] == job_id for j in jobs["jobs"])
+
+        waited = await mgr.request("job_wait", notebook_id="job-nb", extra={
+            "job_id": job_id, "timeout": 5.0,
+        }, timeout=8.0)
+        assert waited["success"] is True
+        assert "job_output_marker" in waited["stdout"]
+
+        logs = await mgr.request("job_logs", notebook_id="job-nb", extra={
+            "job_id": job_id,
+        }, timeout=5.0)
+        assert logs["success"] is True
+        assert "job_output_marker" in logs["stdout"]
+    finally:
+        runner.shutdown()
+        proxy._request_shutdown()
+        server_task.cancel()
+        try:
+            await server_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 @pytest.mark.asyncio

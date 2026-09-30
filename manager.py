@@ -393,13 +393,41 @@ def build_parser() -> argparse.ArgumentParser:
                    help="shell command to run")
     p.add_argument("--stream", action="store_true",
                    help="stream output lines as they are produced")
-    p.add_argument("--timeout", type=float, default=None,
-                   help="command timeout in seconds")
+    p.add_argument("--timeout", type=float, default=None, dest="command_timeout",
+                   help="command timeout in seconds; the command is killed and "
+                        "its output returned when it elapses")
+    p.add_argument("--wait", type=float, default=None,
+                   help="seconds to wait for output before detaching the "
+                        "command and returning a job_id (default: 30)")
 
     p = sub.add_parser("subprocess", help="launch a background subprocess")
     _add_common(p)
     p.add_argument("shell_cmd", metavar="command",
                    help="command to launch in the background")
+
+    p = sub.add_parser("jobs", help="list background shell jobs")
+    _add_common(p)
+
+    p = sub.add_parser("job-info", help="show metadata of a background shell job")
+    _add_common(p)
+    p.add_argument("job_id")
+
+    p = sub.add_parser("job-logs", help="show output of a background shell job")
+    _add_common(p)
+    p.add_argument("job_id")
+    p.add_argument("--tail", type=int, default=200)
+
+    p = sub.add_parser("job-wait", help="wait for a background shell job")
+    _add_common(p)
+    p.add_argument("job_id")
+    p.add_argument("--wait", type=float, default=30.0,
+                   help="seconds to wait before returning (default: 30)")
+    p.add_argument("--kill", action="store_true",
+                   help="terminate the job if it is still running when the wait elapses")
+
+    p = sub.add_parser("job-terminate", help="terminate a background shell job")
+    _add_common(p)
+    p.add_argument("job_id")
 
     p = sub.add_parser("terminate", help="terminate a managed process")
     _add_common(p)
@@ -480,9 +508,21 @@ def _command_mapping(args: argparse.Namespace, mgr: InferenceClientManager
     if args.command == "shell":
         return "shell_exec", nb, {"shell_command": args.shell_cmd,
                                   "stream": args.stream,
-                                  "timeout": args.timeout}
+                                  "timeout": args.command_timeout,
+                                  "wait": args.wait}
     if args.command == "subprocess":
         return "process_start", nb, {"shell_command": args.shell_cmd}
+    if args.command == "jobs":
+        return "job_list", nb, None
+    if args.command == "job-info":
+        return "job_info", nb, {"job_id": args.job_id}
+    if args.command == "job-logs":
+        return "job_logs", nb, {"job_id": args.job_id, "tail": args.tail}
+    if args.command == "job-wait":
+        return "job_wait", nb, {"job_id": args.job_id, "timeout": args.wait,
+                                "kill_on_timeout": args.kill}
+    if args.command == "job-terminate":
+        return "job_terminate", nb, {"job_id": args.job_id}
     if args.command == "terminate":
         return "process_terminate", nb, {"process_id": args.process_id}
     if args.command == "ps":
@@ -536,8 +576,21 @@ async def _run_command(args: argparse.Namespace,
             line = p.get("line", "")
             print(f"[{p.get('stream', 'out')}] {line}", file=sys.stderr)
 
+    mgr_timeout = args.timeout if args.timeout is not None else 120.0
+    if command == "shell_exec" and extra is not None:
+        command_timeout = extra.get("timeout")
+        if command_timeout is not None:
+            budget = float(command_timeout)
+        else:
+            wait_val = extra.get("wait")
+            budget = float(wait_val) if wait_val is not None else 30.0
+        mgr_timeout = budget + 10.0
+    elif command == "job_wait" and extra is not None:
+        wait_val = extra.get("timeout")
+        mgr_timeout = (float(wait_val) + 10.0) if wait_val is not None else mgr_timeout
+
     return await mgr.request(command, notebook_id=nb, extra=extra,
-                             timeout=extra.get("timeout") if extra else None,
+                             timeout=mgr_timeout,
                              stream_cb=stream_cb)
 
 

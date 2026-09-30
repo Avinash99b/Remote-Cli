@@ -64,6 +64,13 @@ class CommandType(Enum):
     PROCESS_LIST = "process_list"
     PROCESS_LOGS = "process_logs"
     PROCESS_WAIT = "process_wait"
+
+    # Job management (background shell jobs)
+    JOB_LIST = "job_list"
+    JOB_INFO = "job_info"
+    JOB_LOGS = "job_logs"
+    JOB_WAIT = "job_wait"
+    JOB_TERMINATE = "job_terminate"
     
     # Environment variables
     ENV_LIST = "env_list"
@@ -299,16 +306,19 @@ class CommandPayloads:
         }
     
     @staticmethod
-    def shell_exec(command: str, cwd: Optional[str] = None, 
-                   env: Optional[Dict[str, str]] = None, timeout: Optional[float] = None) -> Dict[str, Any]:
+    def shell_exec(command: str, cwd: Optional[str] = None,
+                   env: Optional[Dict[str, str]] = None, timeout: Optional[float] = None,
+                   wait: Optional[float] = None, stream: bool = False) -> Dict[str, Any]:
         return {
             "command": CommandType.SHELL_EXEC.value,
             "shell_command": command,
             "cwd": cwd,
             "env": env or {},
-            "timeout": timeout
+            "timeout": timeout,
+            "wait": wait,
+            "stream": stream,
         }
-    
+
     @staticmethod
     def shell_exec_async(command: str, cwd: Optional[str] = None,
                          env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -317,6 +327,36 @@ class CommandPayloads:
             "shell_command": command,
             "cwd": cwd,
             "env": env or {}
+        }
+
+    @staticmethod
+    def job_list() -> Dict[str, Any]:
+        return {"command": CommandType.JOB_LIST.value}
+
+    @staticmethod
+    def job_info(job_id: str) -> Dict[str, Any]:
+        return {"command": CommandType.JOB_INFO.value, "job_id": job_id}
+
+    @staticmethod
+    def job_logs(job_id: str, tail: int = 200) -> Dict[str, Any]:
+        return {"command": CommandType.JOB_LOGS.value, "job_id": job_id, "tail": tail}
+
+    @staticmethod
+    def job_wait(job_id: str, timeout: Optional[float] = None,
+                 kill_on_timeout: bool = False) -> Dict[str, Any]:
+        return {
+            "command": CommandType.JOB_WAIT.value,
+            "job_id": job_id,
+            "timeout": timeout,
+            "kill_on_timeout": kill_on_timeout,
+        }
+
+    @staticmethod
+    def job_terminate(job_id: str, signal: int = 15) -> Dict[str, Any]:
+        return {
+            "command": CommandType.JOB_TERMINATE.value,
+            "job_id": job_id,
+            "signal": signal,
         }
     
     @staticmethod
