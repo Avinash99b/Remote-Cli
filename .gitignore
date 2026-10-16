@@ -6,5 +6,6 @@ remote-cli
 remote-cli-server
 client
 .notebook_identity.json
+.python-version
 
 

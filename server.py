@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-testing_proxy.py
-================
-Central WebSocket intermediary for the remote testing framework.
+server.py (remote-cli-server)
+=============================
+Central WebSocket intermediary for the remote execution framework.
 
 The proxy coordinates two kinds of client:
 
-  * ``manager`` clients (inference_client_manager.py) connect to the
+  * ``manager`` clients (manager.py / remote-cli) connect to the
     ``/manager`` path, issue commands, and receive responses/streams.
-  * ``runner`` clients (kaggle_notebook_testing_runner.py) connect to the
+  * ``runner`` clients (client.py / client) connect to the
     ``/notebook`` path, register a stable notebook id, and receive commands.
 
 The proxy is intentionally stateless with respect to notebook *functionality*
@@ -26,7 +26,7 @@ coordination:
 
 Usage
 -----
-    python testing_proxy.py --host 0.0.0.0 --port 8765 \\
+    python server.py --host 0.0.0.0 --port 8765 \\
         --token optional-shared-secret [--log-level DEBUG]
 """
 

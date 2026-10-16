@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-inference_client_manager.py
-===========================
-Command-line controller for AI agents (and humans) that want to verify the
-inference-proxy infrastructure against real Kaggle notebook runners.
+manager.py (remote-cli)
+=======================
+Command-line controller for developers and AI agents that want to control
+remote compute instances (such as Kaggle notebooks or GPU nodes) through the proxy.
 
-This program talks *only* to testing_proxy.py. It can list connected
-notebooks, push/pull files, run shell commands, manage subprocesses, inspect
+This program talks *only* to server.py. It can list connected
+notebooks, push/pull files, run shell commands, manage background jobs, inspect
 or mutate environment variables, execute Python snippets, and query live
 system information -- all routed through the proxy to a targeted notebook.
 
@@ -16,33 +16,44 @@ remote/proxy error.
 
 Usage
 -----
-    python inference_client_manager.py [--proxy-url ws://host:8765/manager] \\
+    python manager.py [--proxy-url ws://host:8765/manager] \\
         [--token SECRET] <command> <args...>
 
 Example commands
 ----------------
-    python inference_client_manager.py list
-    python inference_client_manager.py info nb-abc123
-    python inference_client_manager.py push nb-abc123 proxy.py
-    python inference_client_manager.py pull nb-abc123 remote.log
-    python inference_client_manager.py execute nb-abc123 my_test.py
-    python inference_client_manager.py shell nb-abc123 "pip install vllm"
-    python inference_client_manager.py subprocess nb-abc123 "python server.py"
-    python inference_client_manager.py terminate nb-abc123 <process_id>
-    python inference_client_manager.py ps nb-abc123
-    python inference_client_manager.py logs nb-abc123 [process_id]
-    python inference_client_manager.py pwd nb-abc123
-    python inference_client_manager.py cd nb-abc123 /kaggle/working
-    python inference_client_manager.py mkdir nb-abc123 models
-    python inference_client_manager.py rm nb-abc123 server.py
-    python inference_client_manager.py env list nb-abc123
-    python inference_client_manager.py env get nb-abc123 HF_TOKEN
-    python inference_client_manager.py env set nb-abc123 HF_TOKEN xxx
-    python inference_client_manager.py env unset nb-abc123 HF_TOKEN
-    python inference_client_manager.py heartbeat
-    python inference_client_manager.py ping nb-abc123
-    python inference_client_manager.py system-info nb-abc123
-    python inference_client_manager.py reconnect
+    python manager.py list
+    python manager.py info nb-abc123
+    python manager.py push nb-abc123 local.py remote.py
+    python manager.py pull nb-abc123 remote.log local.log
+    python manager.py execute nb-abc123 local_test.py
+    python manager.py shell nb-abc123 "pip install vllm"
+    python manager.py subprocess nb-abc123 "python server.py"
+    python manager.py jobs nb-abc123
+    python manager.py job-info nb-abc123 <job_id>
+    python manager.py job-logs nb-abc123 <job_id>
+    python manager.py job-wait nb-abc123 <job_id>
+    python manager.py job-terminate nb-abc123 <job_id>
+    python manager.py terminate nb-abc123 <process_id>
+    python manager.py ps nb-abc123
+    python manager.py logs nb-abc123 [process_id]
+    python manager.py ls nb-abc123 [path]
+    python manager.py cp nb-abc123 src.py dst.py
+    python manager.py mv nb-abc123 src.py dst.py
+    python manager.py eval nb-abc123 "import torch; print(torch.cuda.is_available())"
+    python manager.py restart nb-abc123 <process_id>
+    python manager.py pwd nb-abc123
+    python manager.py cd nb-abc123 /kaggle/working
+    python manager.py mkdir nb-abc123 models
+    python manager.py rm nb-abc123 server.py
+    python manager.py env list nb-abc123
+    python manager.py env get nb-abc123 HF_TOKEN
+    python manager.py env set nb-abc123 HF_TOKEN xxx
+    python manager.py env unset nb-abc123 HF_TOKEN
+    python manager.py heartbeat
+    python manager.py ping nb-abc123
+    python manager.py system-info nb-abc123
+    python manager.py reconnect
+    python manager.py shutdown nb-abc123
 
 Configuration can also be supplied via environment variables
 ``TESTING_PROXY_URL`` and ``TESTING_PROXY_TOKEN``.
@@ -233,53 +244,72 @@ class InferenceClientManager:
             "remote_path": remote_path,
         }
         msg = Message(message_type=MessageType.COMMAND, payload=payload)
-        chunks: List[bytes] = []
         meta: Dict[str, Any] = {}
+        hasher = hashlib.sha256()
+        total_bytes = 0
 
-        async with await self._open() as ws:
-            await ws.send(msg.to_json())
-            while True:
-                raw = await asyncio.wait_for(
-                    ws.recv(), timeout=self.timeout)
-                try:
-                    rmsg = Message.from_json(raw)
-                except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
-                    log.warning("[MANAGER PULL] unparseable message: %s", exc)
-                    continue
-                if rmsg.correlation_id != msg.message_id:
-                    continue
-                if rmsg.message_type == MessageType.COMMAND_STREAM:
-                    p = rmsg.payload
-                    if p.get("kind") == "download_chunk":
-                        chunks.append(base64.b64decode(p["content"]))
-                        meta.update(p)
-                    continue
-                if rmsg.message_type == MessageType.COMMAND_RESPONSE:
-                    p = rmsg.payload
-                    if p.get("success") is False:
-                        return p
-                    meta.update(p)
-                    break
+        target_dir = os.path.dirname(os.path.abspath(local)) or "."
+        os.makedirs(target_dir, exist_ok=True)
+        tmp_local = f"{local}.tmp.{uuid.uuid4().hex[:6]}"
 
-        if not meta.get("complete"):
-            return {"success": False,
-                    "error": "download did not complete", "meta": meta}
-        data = b"".join(chunks)
-        expected = meta.get("bytes", len(data))
-        digest = hashlib.sha256(data).hexdigest()
-        os.makedirs(os.path.dirname(os.path.abspath(local)) or ".", exist_ok=True)
-        with open(local, "wb") as fh:
-            fh.write(data)
-        ok = len(data) == expected
-        return {
-            "success": ok,
-            "local_path": local,
-            "remote_path": remote_path,
-            "bytes": len(data),
-            "sha256": digest,
-            "expected_bytes": expected,
-            "integrity_ok": ok,
-        }
+        try:
+            with open(tmp_local, "wb") as out_fh:
+                async with await self._open() as ws:
+                    await ws.send(msg.to_json())
+                    while True:
+                        raw = await asyncio.wait_for(
+                            ws.recv(), timeout=self.timeout)
+                        try:
+                            rmsg = Message.from_json(raw)
+                        except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+                            log.warning("[MANAGER PULL] unparseable message: %s", exc)
+                            continue
+                        if rmsg.correlation_id != msg.message_id:
+                            continue
+                        if rmsg.message_type == MessageType.COMMAND_STREAM:
+                            p = rmsg.payload
+                            if p.get("kind") == "download_chunk":
+                                chunk = base64.b64decode(p["content"])
+                                out_fh.write(chunk)
+                                hasher.update(chunk)
+                                total_bytes += len(chunk)
+                                meta.update(p)
+                            continue
+                        if rmsg.message_type == MessageType.COMMAND_RESPONSE:
+                            p = rmsg.payload
+                            if p.get("success") is False:
+                                return p
+                            meta.update(p)
+                            break
+
+            if not meta.get("complete"):
+                if os.path.exists(tmp_local):
+                    os.remove(tmp_local)
+                return {"success": False,
+                        "error": "download did not complete", "meta": meta}
+
+            expected = meta.get("bytes", total_bytes)
+            digest = hasher.hexdigest()
+            ok = (total_bytes == expected) and (digest == meta.get("sha256", digest))
+            if ok:
+                os.replace(tmp_local, local)
+            else:
+                if os.path.exists(tmp_local):
+                    os.remove(tmp_local)
+
+            return {
+                "success": ok,
+                "local_path": local,
+                "remote_path": remote_path,
+                "bytes": total_bytes,
+                "sha256": digest,
+                "expected_bytes": expected,
+                "integrity_ok": ok,
+            }
+        except Exception:
+            if os.path.exists(tmp_local):
+                os.remove(tmp_local)
+            raise
 
     # ------------------------------------------------------------------ #
     # High-level convenience commands
@@ -456,6 +486,34 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p)
     p.add_argument("path")
 
+    p = sub.add_parser("ls", help="list files on remote runner")
+    _add_common(p)
+    p.add_argument("path", nargs="?", default=".", help="remote path to list")
+    p.add_argument("-r", "--recursive", action="store_true", help="recursively list directories")
+
+    p = sub.add_parser("cp", help="copy file or directory on remote runner")
+    _add_common(p)
+    p.add_argument("src", help="source path")
+    p.add_argument("dst", help="destination path")
+
+    p = sub.add_parser("mv", help="move or rename file/directory on remote runner")
+    _add_common(p)
+    p.add_argument("src", help="source path")
+    p.add_argument("dst", help="destination path")
+
+    p = sub.add_parser("eval", help="execute python code in remote persistent namespace")
+    _add_common(p)
+    p.add_argument("code", help="python code to evaluate")
+    p.add_argument("--capture-locals", action="store_true", help="return captured locals")
+
+    p = sub.add_parser("restart", help="restart a managed process")
+    _add_common(p)
+    p.add_argument("process_id", help="managed process id")
+
+    p = sub.add_parser("shutdown", help="shut down the remote runner")
+    _add_common(p)
+    p.add_argument("--no-terminate-processes", action="store_true", help="leave processes running")
+
     p = sub.add_parser("ping", help="ping a notebook")
     _add_common(p)
 
@@ -537,6 +595,18 @@ def _command_mapping(args: argparse.Namespace, mgr: InferenceClientManager
         return "file_mkdir", nb, {"path": args.path}
     if args.command == "rm":
         return "file_delete", nb, {"remote_path": args.path, "recursive": True}
+    if args.command == "ls":
+        return "file_list", nb, {"path": args.path, "recursive": args.recursive}
+    if args.command == "cp":
+        return "file_copy", nb, {"src": args.src, "dst": args.dst}
+    if args.command == "mv":
+        return "file_move", nb, {"src": args.src, "dst": args.dst}
+    if args.command == "eval":
+        return "python_exec", nb, {"code": args.code, "capture_locals": args.capture_locals}
+    if args.command == "restart":
+        return "process_restart", nb, {"process_id": args.process_id}
+    if args.command == "shutdown":
+        return "notebook_shutdown", nb, {"terminate_processes": not args.no_terminate_processes}
     if args.command == "ping":
         return "notebook_ping", nb, None
     if args.command == "system-info":
@@ -581,13 +651,15 @@ async def _run_command(args: argparse.Namespace,
         command_timeout = extra.get("timeout")
         if command_timeout is not None:
             budget = float(command_timeout)
+            mgr_timeout = max(mgr_timeout, budget + 10.0)
         else:
             wait_val = extra.get("wait")
             budget = float(wait_val) if wait_val is not None else 30.0
-        mgr_timeout = budget + 10.0
+            mgr_timeout = max(mgr_timeout, budget + 10.0)
     elif command == "job_wait" and extra is not None:
         wait_val = extra.get("timeout")
-        mgr_timeout = (float(wait_val) + 10.0) if wait_val is not None else mgr_timeout
+        if wait_val is not None:
+            mgr_timeout = max(mgr_timeout, float(wait_val) + 10.0)
 
     return await mgr.request(command, notebook_id=nb, extra=extra,
                              timeout=mgr_timeout,

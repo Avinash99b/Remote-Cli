@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-kaggle_notebook_testing_runner.py
-=================================
+client.py (remote-cli client runner)
+====================================
 
-Remote agent that runs *inside an actual Kaggle notebook* and lets AI agents
-drive the notebook through the testing proxy.
+Remote execution daemon that runs *inside an actual Kaggle notebook,
+Google Colab, or cloud GPU VM* and lets developers and AI agents drive the node
+through the central proxy server.
 
-The runner connects outbound to testing_proxy.py, registers a stable
+The runner connects outbound to server.py, registers a stable
 notebook id, then waits for commands. It exposes remote operations for:
 
   * file operations (upload/download/delete/move/copy, mkdir/rmdir, list)
@@ -26,13 +27,13 @@ Pip-install the websockets package if needed, then launch this program in a
 background cell (the notebook kernel keeps the loop alive):
 
     !pip install -q websockets
-    !nohup python /kaggle/working/kaggle_notebook_testing_runner.py \\
+    !nohup python /kaggle/working/client.py \\
         --proxy ws://<PROXY_HOST>:8765/notebook --token <OPTIONAL> \\
         > /kaggle/working/runner.log 2>&1 &
 
 Or call :func:`start_in_background` from a Python cell:
 
-    from kaggle_notebook_testing_runner import start_in_background
+    from client import start_in_background
     start_in_background(proxy_url="ws://<PROXY_HOST>:8765/notebook",
                         token="<OPTIONAL>")
 
@@ -42,7 +43,7 @@ the same notebook id.
 
 Usage
 -----
-    python kaggle_notebook_testing_runner.py \\
+    python client.py \\
         --proxy ws://host:8765/notebook [--token SECRET] [--notebook-id ID]
 """
 
@@ -688,8 +689,20 @@ class KaggleNotebookRunner:
                 "path": target, "bytes": len(data),
             }
 
-        buf = self._upload_buffers.setdefault(
-            target, {"chunks": {}, "total": total_chunks})
+        # Clean up stale upload buffers older than 10 minutes
+        now = time.time()
+        stale_targets = [k for k, v in self._upload_buffers.items()
+                         if (now - v.get("started_at", now)) > 600.0]
+        for st in stale_targets:
+            self._upload_buffers.pop(st, None)
+
+        # Chunk 0 starts a fresh buffer to prevent stale chunk corruption on retry
+        if chunk_index == 0 or target not in self._upload_buffers:
+            self._upload_buffers[target] = {
+                "chunks": {}, "total": total_chunks, "started_at": now,
+            }
+
+        buf = self._upload_buffers[target]
         buf["chunks"][chunk_index] = data
         if len(buf["chunks"]) >= buf["total"]:
             ordered = b"".join(buf["chunks"][i] for i in range(buf["total"]))
@@ -715,27 +728,32 @@ class KaggleNotebookRunner:
                 "success": False, "error": f"no such file: {target}",
             })
             return
+
+        file_size = os.path.getsize(target)
+        total = max(1, (file_size + COMMAND_CHUNK_SIZE - 1) // COMMAND_CHUNK_SIZE)
+        hasher = hashlib.sha256()
+
         with open(target, "rb") as fh:
-            data = fh.read()
-        total = max(1, (len(data) + COMMAND_CHUNK_SIZE - 1) // COMMAND_CHUNK_SIZE)
-        for i in range(total):
-            chunk = data[i * COMMAND_CHUNK_SIZE:(i + 1) * COMMAND_CHUNK_SIZE]
-            self._stream(msg, {
-                "kind": "download_chunk",
-                "path": target,
-                "chunk_index": i,
-                "total_chunks": total,
-                "content": base64.b64encode(chunk).decode(),
-                "encoding": "base64",
-                "complete": False,
-            })
+            for i in range(total):
+                chunk = fh.read(COMMAND_CHUNK_SIZE)
+                hasher.update(chunk)
+                self._stream(msg, {
+                    "kind": "download_chunk",
+                    "path": target,
+                    "chunk_index": i,
+                    "total_chunks": total,
+                    "content": base64.b64encode(chunk).decode(),
+                    "encoding": "base64",
+                    "complete": False,
+                })
+
         self._reply(msg, {
             "kind": "download_complete",
             "path": target,
-            "bytes": len(data),
+            "bytes": file_size,
             "total_chunks": total,
             "complete": True,
-            "sha256": hashlib.sha256(data).hexdigest(),
+            "sha256": hasher.hexdigest(),
         })
 
     def _cmd_file_delete(self, msg: Message) -> Dict[str, Any]:
@@ -743,10 +761,11 @@ class KaggleNotebookRunner:
         recursive = msg.payload.get("recursive", False)
         if not os.path.exists(path):
             return {"success": False, "error": f"no such path: {path}"}
-        if os.path.isdir(path) and not recursive:
-            shutil.rmtree(path)
-        elif os.path.isdir(path):
-            shutil.rmtree(path)
+        if os.path.isdir(path):
+            if recursive:
+                shutil.rmtree(path)
+            else:
+                os.rmdir(path)
         else:
             os.remove(path)
         return {"success": True, "path": path}

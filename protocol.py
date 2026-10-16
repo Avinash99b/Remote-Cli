@@ -91,7 +91,7 @@ class CommandType(Enum):
     NOTEBOOK_RESTART = "notebook_restart"
     NOTEBOOK_SHUTDOWN = "notebook_shutdown"
 
-    # Proxy-level (handled by testing_proxy.py, not forwarded to runners)
+    # Proxy-level (handled by server.py / remote-cli-server, not forwarded to runners)
     PROXY_LIST = "proxy_list"
     PROXY_INFO = "proxy_info"
     PROXY_HEARTBEAT = "proxy_heartbeat"

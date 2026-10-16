@@ -411,3 +411,166 @@ def test_reconnect_backoff_interruptible():
     assert not t.is_alive()
     assert elapsed < 3.0
 
+
+def test_file_delete_directory_non_recursive_safety():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runner = KaggleNotebookRunner(proxy_url="ws://localhost:12345/notebook")
+        runner._cwd = tmpdir
+        subdir = os.path.join(tmpdir, "subdir")
+        os.makedirs(subdir)
+        with open(os.path.join(subdir, "file.txt"), "w") as f:
+            f.write("content")
+
+        # Non-recursive delete on non-empty directory should fail safely without removing files
+        msg = Message(message_type=MessageType.COMMAND, payload={"remote_path": subdir, "recursive": False})
+        with pytest.raises(OSError):
+            runner._cmd_file_delete(msg)
+        assert os.path.exists(os.path.join(subdir, "file.txt"))
+
+        # Recursive delete should succeed
+        msg_rec = Message(message_type=MessageType.COMMAND, payload={"remote_path": subdir, "recursive": True})
+        res = runner._cmd_file_delete(msg_rec)
+        assert res["success"] is True
+        assert not os.path.exists(subdir)
+
+
+def test_python_exec_persistent_namespace():
+    runner = KaggleNotebookRunner(proxy_url="ws://localhost:12345/notebook")
+    # Step 1: define a variable and function
+    msg1 = Message(message_type=MessageType.COMMAND, payload={"code": "x = 42\ndef get_val(): return x * 2"})
+    res1 = runner._cmd_python_exec(msg1)
+    assert res1["success"] is True
+
+    # Step 2: call the function and check persistent namespace
+    msg2 = Message(message_type=MessageType.COMMAND, payload={"code": "get_val()"})
+    res2 = runner._cmd_python_exec(msg2)
+    assert res2["success"] is True
+    assert res2["result"] == 84
+
+
+def test_env_management_and_overlay():
+    runner = KaggleNotebookRunner(proxy_url="ws://localhost:12345/notebook")
+    # env_set
+    set_msg = Message(message_type=MessageType.COMMAND, payload={"key": "REMOTE_TEST_VAR", "value": "magic_123"})
+    runner._cmd_env_set(set_msg)
+
+    # env_get
+    get_msg = Message(message_type=MessageType.COMMAND, payload={"key": "REMOTE_TEST_VAR"})
+    res_get = runner._cmd_env_get(get_msg)
+    assert res_get["value"] == "magic_123"
+
+    # env_list
+    list_msg = Message(message_type=MessageType.COMMAND, payload={})
+    res_list = runner._cmd_env_list(list_msg)
+    assert res_list["overlay"]["REMOTE_TEST_VAR"] == "magic_123"
+
+    # env_unset
+    unset_msg = Message(message_type=MessageType.COMMAND, payload={"key": "REMOTE_TEST_VAR"})
+    runner._cmd_env_unset(unset_msg)
+    res_get2 = runner._cmd_env_get(get_msg)
+    assert res_get2["value"] is None
+
+
+def test_cli_parser_all_subcommands():
+    from manager import build_parser, _command_mapping
+    parser = build_parser()
+
+    # Test parser accepts <subcommand> <notebook_id>
+    args = parser.parse_args(["shell", "nb-1", "echo hi", "--timeout", "10"])
+    cmd, nb, extra = _command_mapping(args, None)
+    assert cmd == "shell_exec"
+    assert nb == "nb-1"
+    assert extra["shell_command"] == "echo hi"
+
+    args = parser.parse_args(["push", "nb-1", "local.txt", "remote.txt"])
+    cmd, nb, extra = _command_mapping(args, None)
+    assert cmd == "__push__"
+    assert nb == "nb-1"
+
+    args = parser.parse_args(["pull", "nb-1", "remote.txt", "local.txt"])
+    cmd, nb, extra = _command_mapping(args, None)
+    assert cmd == "__pull__"
+    assert nb == "nb-1"
+
+    args = parser.parse_args(["ls", "nb-1", "/tmp", "-r"])
+    cmd, nb, extra = _command_mapping(args, None)
+    assert cmd == "file_list"
+    assert extra["recursive"] is True
+
+    args = parser.parse_args(["cp", "nb-1", "src.txt", "dst.txt"])
+    cmd, nb, extra = _command_mapping(args, None)
+    assert cmd == "file_copy"
+
+    args = parser.parse_args(["mv", "nb-1", "src.txt", "dst.txt"])
+    cmd, nb, extra = _command_mapping(args, None)
+    assert cmd == "file_move"
+
+    args = parser.parse_args(["eval", "nb-1", "1 + 1"])
+    cmd, nb, extra = _command_mapping(args, None)
+    assert cmd == "python_exec"
+    assert extra["code"] == "1 + 1"
+
+    args = parser.parse_args(["restart", "nb-1", "proc-123"])
+    cmd, nb, extra = _command_mapping(args, None)
+    assert cmd == "process_restart"
+
+    args = parser.parse_args(["shutdown", "nb-1"])
+    cmd, nb, extra = _command_mapping(args, None)
+    assert cmd == "notebook_shutdown"
+
+
+@pytest.mark.asyncio
+async def test_full_push_pull_chunked_transfer():
+    port = 18771
+    proxy = TestingProxy(host="127.0.0.1", port=port, heartbeat_timeout=5.0)
+    server_task = asyncio.create_task(proxy.serve_forever())
+    await asyncio.sleep(0.2)
+
+    with tempfile.TemporaryDirectory() as tmp_remote, tempfile.TemporaryDirectory() as tmp_local:
+        runner = KaggleNotebookRunner(
+            proxy_url=f"ws://127.0.0.1:{port}/notebook",
+            notebook_id="file-nb",
+            heartbeat_interval=0.5,
+        )
+        runner._cwd = tmp_remote
+        import threading
+        t = threading.Thread(target=runner.run, daemon=True)
+        t.start()
+        await asyncio.sleep(0.4)
+
+        mgr = InferenceClientManager(proxy_url=f"ws://127.0.0.1:{port}/manager")
+        try:
+            # 1. Create a binary file locally (1.5 MB to test multi-chunk transfer)
+            local_file = os.path.join(tmp_local, "test_data.bin")
+            content = os.urandom(1500 * 1024)
+            with open(local_file, "wb") as f:
+                f.write(content)
+            import hashlib
+            orig_hash = hashlib.sha256(content).hexdigest()
+
+            # 2. Push to remote runner
+            push_res = await mgr.push("file-nb", local_file, "remote_data.bin")
+            assert push_res["success"] is True
+            assert push_res["bytes"] == len(content)
+
+            # 3. Pull back to local directory
+            downloaded_file = os.path.join(tmp_local, "downloaded.bin")
+            pull_res = await mgr.pull("file-nb", "remote_data.bin", downloaded_file)
+            assert pull_res["success"] is True
+            assert pull_res["bytes"] == len(content)
+            assert pull_res["sha256"] == orig_hash
+            assert pull_res["integrity_ok"] is True
+
+            with open(downloaded_file, "rb") as f:
+                downloaded_content = f.read()
+            assert downloaded_content == content
+        finally:
+            runner.shutdown()
+            proxy._request_shutdown()
+            server_task.cancel()
+            try:
+                await server_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
